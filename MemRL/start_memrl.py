@@ -228,6 +228,18 @@ def run_checks(cfg, base, checkpoint, require_environment=True, exact_environmen
             result = subprocess.run(['docker', 'image', 'inspect', image], capture_output=True, timeout=15)
             if result.returncode:
                 missing.append(task)
+        if missing and cfg['environment'].get('readiness_mode') == 'per-group-v1':
+            manifest = read_json(referenced(cfg['data']['public_manifest'], base))
+            first = next(episode for episode in manifest['episodes'] if episode['split'] == 'train')
+            required = {task['identity']['query_id'] or task['identity']['sample_id'] for task in first['tasks']}
+            main_ids = set(required)
+            required.update(probe['identity']['query_id'] or probe['identity']['sample_id']
+                            for probe in manifest['probes']
+                            if set(probe['probe_certificate']['source_task_ids']) & main_ids)
+            if required & set(missing):
+                raise ValueError('首组镜像缺失：' + ', '.join(sorted(required & set(missing))))
+            return {'available': len(env['swe']['allowed_images']) - len(missing),
+                    'deferred_until_group_gate': missing, 'first_group_available': True}
         if missing:
             raise ValueError('本地缺少镜像：' + ', '.join(missing))
         return {'available': len(env['swe']['allowed_images'])}
