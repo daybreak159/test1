@@ -21,6 +21,17 @@ def slate_loss(new_joint_logprob, old_joint_logprob, advantage, row_weight, divi
     return -clipped_surrogate(new_joint_logprob, old_joint_logprob, advantage, epsilon) * row_weight / divisor
 
 
+def policy_gradient_loss(logprobs, advantage, row_weight, divisor=768, mask=None):
+    """One frozen batch, one step: no behavior ratio, clipping or correction."""
+    import torch
+
+    if divisor <= 0:
+        raise ValueError('Common divisor must be positive')
+    selected = logprobs if mask is None else logprobs[mask]
+    advantage = torch.as_tensor(advantage, dtype=logprobs.dtype, device=logprobs.device).detach()
+    return -selected.sum() * advantage * row_weight / divisor
+
+
 def ddp_local_weighted_sum(loss, world_size):
     """DDP averages gradients; recover the global weighted sum, not a rank/microbatch mean."""
     return loss * world_size

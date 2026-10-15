@@ -52,8 +52,8 @@ def starter_config(domain):
             "max_input_tokens": 8192,
             "input_limits": {"E": 65536, "U": 8192} if domain == "swe" else {},
             "limits": {"E": 384, "U": 768}, "temperature": 1.0,
-            # Cached Qwen3.5 decode must pass a real behavior/recompute audit first.
-            "use_generation_cache": False,
+            # Single-step PG accepts finite cached/recompute drift as a diagnostic.
+            "use_generation_cache": True,
         },
         "source_packing": "compact_exact_v1" if domain == "swe" else "reject",
         "rollout": {"backend": "hf"},
@@ -89,6 +89,7 @@ def starter_config(domain):
             "epsilon": 0.2,
             "max_grad_norm": 1.0,
             "behavior_tolerance": 0.03,
+            "policy_loss": "single_step_pg",
         },
         "schedule": {
             "batches": 100,
@@ -178,6 +179,8 @@ def require_hf_backend(cfg):
         raise ConfigurationError("Current runtime requires rollout.backend=hf; vLLM rollout is retired")
     if cfg.get("optimization", {}).get("rollout_correction"):
         raise ConfigurationError("HF-only runtime does not use HF/vLLM rollout_correction")
+    if cfg.get("optimization", {}).get("policy_loss", "single_step_pg") not in {"single_step_pg", "ppo"}:
+        raise ConfigurationError("optimization.policy_loss must be single_step_pg or ppo")
 
 
 def load_config(path):
@@ -189,6 +192,8 @@ def load_config(path):
     if cfg.get("domain") not in DOMAINS:
         raise ConfigurationError("Exactly one known domain per run")
     cfg.setdefault("rollout", {}).setdefault("backend", "hf")
+    cfg.setdefault("optimization", {}).setdefault("policy_loss", "single_step_pg")
+    cfg.setdefault("generation", {}).setdefault("use_generation_cache", True)
     require_hf_backend(cfg)
     profile = cfg.setdefault("generation", {}).setdefault("prompt_profile", "e-text-v1")
     if cfg.get("e_preprocessing", {}).get("profile") == "swe-evidence-hybrid-v1":

@@ -203,6 +203,7 @@ class Runtime:
                 cfg["domain"],
                 self.checkpoints,
                 **cfg["optimization"],
+                probability_diagnostics_path=resolved(cfg, cfg["output_dir"]) / "probability_diagnostics.jsonl",
                 train_roles=cfg["experiment"]["train_roles"],
             )
             if with_optimizer

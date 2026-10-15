@@ -89,7 +89,10 @@ def prepare(config_path, checkpoint, root):
     cfg['rollout'] = {'backend': 'hf'}
     cfg['optimization'].pop('rollout_correction', None)
     cfg.pop('first_task_replay', None)
-    cfg['generation'].update(prompt_profile='e-text-v1', use_generation_cache=False)
+    policy_loss = cfg['optimization'].setdefault('policy_loss', 'single_step_pg')
+    if policy_loss not in {'single_step_pg', 'ppo'}:
+        raise ValueError('Unknown optimization.policy_loss')
+    cfg['generation'].update(prompt_profile='e-text-v1', use_generation_cache=policy_loss == 'single_step_pg')
     cfg['generation']['input_limits'] = {'E': 32768, 'U': 8192}
     cfg['architecture'].update(gradient_checkpointing=True, activation_offload=True, mlp_chunk_tokens=1024)
     cfg['runtime'].update(hf_attention_backend='flash-gqa', hf_pointwise_chunk_tokens=512)

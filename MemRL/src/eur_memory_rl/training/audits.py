@@ -5,6 +5,7 @@ from ..policies.direct_choice import forward_option_logits, project_option_logit
 from ..policies.prompts import encode_messages, slot_ids
 from ..util import atomic_json
 from .checkpoint import adapter_state, random_state, restore_random_state
+from .probability_diagnostics import probability_diagnostics
 
 
 def inspect_model(config, output):
@@ -80,12 +81,16 @@ def model_audit(shared, generator, cfg, output):
                 generator.limits = old_limits
             with shared.activate(role, train=True):
                 values, masks = generator.recompute([record])
-                delta = float(
-                    (values[0].detach() - torch.tensor(record.old_logprobs, device=shared.device)).abs().max()
-                )
-                if delta > cfg["optimization"]["behavior_tolerance"]:
+                stats = probability_diagnostics(values[0], record.old_logprobs, masks[0],
+                                                cfg["optimization"]["behavior_tolerance"])
+                delta = stats["max_abs"]
+                if cfg["optimization"].get("policy_loss", "single_step_pg") == "ppo" and stats["exceeds_tolerance"]:
                     raise RuntimeError(f"Generation behavior drift: {delta}")
                 checks[f"{role}_logprob_max_error"] = delta
+                checks[f"{role}_probability_diagnostics"] = {
+                    "input_tokens": len(record.input_ids), "output_tokens": len(record.response_token_ids),
+                    "mismatch_action": "log" if cfg["optimization"].get("policy_loss", "single_step_pg") == "single_step_pg" else "error",
+                    **stats}
         captured = []
         hook = shared.model.get_output_embeddings().register_forward_pre_hook(
             lambda module, args: captured.append(args[0])
@@ -96,8 +101,8 @@ def model_audit(shared, generator, cfg, output):
                 projected = project_option_logits(
                     captured[-1][:, -1], shared.model.get_output_embeddings(), slots
                 )
-                error = float((gathered - projected).abs().max())
-                if error > 0.05:
+                error = float((gathered - projected).detach().abs().max())
+                if not torch.isfinite(gathered).all() or not torch.isfinite(projected).all() or error > 0.05:
                     raise RuntimeError("Full-vocabulary gather differs from option-row projection")
                 checks["readout_max_error"] = error
         finally:
@@ -113,6 +118,9 @@ def model_audit(shared, generator, cfg, output):
             "checks": checks,
             "model": shared.manifest(),
             "benchmark_validated": False,
+            "policy_loss": cfg["optimization"].get("policy_loss", "single_step_pg"),
+            "behavior_alignment_passed": all(checks[f"{r}_logprob_max_error"] <= cfg["optimization"]["behavior_tolerance"]
+                                             for r in ("E", "U")),
         }
         atomic_json(output, report)
         return report
