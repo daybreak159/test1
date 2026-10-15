@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.test-tmp/
+outputs/
+releases/
+*.log
+*.pt
+*.safetensors
+*.tar.gz
+.env
+auth.json
+*private_key*
+configs
+使用说明.md
