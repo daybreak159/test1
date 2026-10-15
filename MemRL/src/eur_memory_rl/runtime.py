@@ -14,7 +14,7 @@ from .memory.transaction import TransactionExecutor
 from .policies.direct_choice import DirectChoicePolicy
 from .policies.generator import GeneratorPolicy
 from .policies.shared_qwen import SharedQwen
-from .rewards.pair_judge import PairJudge, PairedQuality
+from .rewards.pair_judge import JUDGE_RESPONSE_FORMAT, PairJudge, PairedQuality
 from .rollout.engine import MemoryEngine
 from .rollout.main_stream import MainStream
 from .rollout.paired_probe import PairedProbe
@@ -162,7 +162,8 @@ class Runtime:
                     JSONClient(j["base_url"], j.get("api_key_env")),
                     j["model"],
                     j["revision"],
-                    j["decoding"],
+                    {**j["decoding"], **({'response_format': JUDGE_RESPONSE_FORMAT}
+                       if j.get('structured_output', False) else {})},
                     pricing=j.get("pricing"),
                     resources=self.resources,
                     usage_role="judge",
@@ -170,12 +171,24 @@ class Runtime:
                 j["rubric_version"],
                 self.resources,
                 evidence_profile=j.get("evidence_profile", "raw-v1"),
+                repair_attempts=j.get('repair_attempts', 0),
+                audit_path=resolved(cfg, cfg['output_dir']) / 'judge_format_audit.jsonl',
             )
             if j["base_url"]
             else None
         )
         quality = PairedQuality(self.adapter, judge)
-        local = {k: v for k, v in cfg["local"].items() if k not in {"beta", "anchors_per_replica", "budget"}}
+        # Same frozen profile/weights/decoding; only the transport address differs.
+        from copy import deepcopy
+        self.local_adapters = [self.adapter]
+        for url in cfg.get('local_solver_endpoints', []):
+            if url.rstrip('/') == cfg['consumer']['base_url'].rstrip('/'):
+                raise ValueError('Duplicate local Solver endpoint')
+            worker_cfg = deepcopy(cfg)
+            worker_cfg['consumer']['base_url'] = url
+            self.local_adapters.append(make_adapter(worker_cfg, self.resources))
+        local = {k: v for k, v in cfg["local"].items()
+                 if k not in {"beta", "anchors_per_replica", "budget", "min_legal_candidates"}}
         reference = cfg["experiment"].get("old_reference", True)
         self.probe = PairedProbe(
             self.engine,
@@ -188,6 +201,7 @@ class Runtime:
             reference=reference,
             selector_mode=cfg["experiment"].get("selector_mode", "learned"),
             scoring=cfg["experiment"].get("local_score", "paired"),
+            execution_adapters=self.local_adapters,
         )
         checkpoint_root = (
             resolved(cfg, cfg["checkpoint_dir"]) / cfg["experiment"]["name"] / f"seed-{cfg['seed']}"

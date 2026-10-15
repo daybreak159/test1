@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import time
 import traceback
+from threading import RLock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from eur_memory_rl.util import atomic_json, plain
@@ -13,7 +14,7 @@ from eur_memory_rl.config import load_config, preflight
 
 p = argparse.ArgumentParser()
 p.add_argument("--root", type=Path, required=True)
-p.add_argument("--full-suite", action="store_true", help="Train declared batches and rebuild a frozen 30-task bank")
+p.add_argument("--full-suite", action="store_true", help="Train declared batches and rebuild a frozen main-task bank")
 p.add_argument("--sft-checkpoint", type=Path, help="Continue the same E/U/R weights from a trusted SWE SFT checkpoint")
 p.add_argument("--sft-weights-only", action="store_true", help="Import SWE adapter weights into a new protocol, resetting optimizer and cursor")
 p.add_argument("--startup-only", action="store_true", help="Check model, runtime, 32K backward and HF sampling, then stop before task rollouts or optimizer updates")
@@ -21,17 +22,20 @@ a = p.parse_args()
 root = a.root
 started = time.monotonic()
 summary = {"status": "running", "completed_updates": 0}
+log_lock = RLock()
 
 
 def stage(name, **kw):
-    summary.update(stage=name, wall_seconds=time.monotonic() - started, **kw)
-    atomic_json(root / "summary.json", summary)
-    print("STAGE", name, flush=True)
+    with log_lock:
+        summary.update(stage=name, wall_seconds=time.monotonic() - started, **kw)
+        atomic_json(root / "summary.json", summary)
+        print("STAGE", name, flush=True)
 
 
 def record(name, value):
-    with (root / (name + ".jsonl")).open("a") as f:
-        f.write(json.dumps(plain(value), ensure_ascii=False) + "\n")
+    with log_lock:
+        with (root / (name + ".jsonl")).open("a") as f:
+            f.write(json.dumps(plain(value), ensure_ascii=False) + "\n")
 
 
 try:
@@ -94,7 +98,9 @@ try:
     with hf_attention_backend(attention_backend):
         model_audit(rt.shared, rt.generator, cfg, root / "loaded_sft_model_audit.json")
     stage("hf_policy_ready", rollout_backend="hf", training_backend="hf")
-    for label, model in (("solver", rt.adapter.consumer), ("pair_judge", rt.probe.quality.judge.model)):
+    models = [("solver", rt.adapter.consumer), ("pair_judge", rt.probe.quality.judge.model)]
+    models.extend((f"solver_worker_{i}", a.consumer) for i, a in enumerate(rt.local_adapters[1:], 1))
+    for label, model in models:
         original = model.client.post
 
         def posted(path, payload, request_id=None, _post=original, _label=label):
@@ -152,6 +158,15 @@ try:
         return result
 
     rt.adapter.run_consumer = consumed
+    for worker_index, adapter in enumerate(rt.local_adapters[1:], 1):
+        worker_run = adapter.run_consumer
+        def worker_consumed(task, execution_id, seed, read, budget=None,
+                            _run=worker_run, _index=worker_index):
+            stage('consumer', task_id=task.id, execution_id=execution_id, solver_worker=_index)
+            result = _run(task, execution_id, seed, read, budget)
+            record('executions', {'execution': result, 'task_identity': task.identity, 'solver_worker': _index})
+            return result
+        adapter.run_consumer = worker_consumed
     original_grade = rt.adapter.grade
 
     def graded(task, execution):
@@ -250,7 +265,10 @@ try:
     stage("hf_policy_updated", completed_updates=completed_updates, checkpoint=update["checkpoint"])
     updated_scores = probe_scores()
     atomic_json(root / "updated_rollout_probe.json", {"initial": initial_scores, "updated": updated_scores})
-    changed = [r for r, n in update["parameter_update_norms"].items() if n > 0]
+    all_updates = [json.loads((root / f'rl/update-{n:06d}.json').read_text())
+                   for n in range(1, completed_updates + 1)]
+    changed = sorted({role for item in all_updates
+                      for role, norm in item['parameter_update_norms'].items() if norm > 0})
     atomic_json(
         root / "learning_signal.json",
         {
@@ -258,6 +276,10 @@ try:
             "all_roles_updated": set(changed) == {"E", "U", "R"},
             "gradient_norms": update["gradient_norms"],
             "parameter_update_norms": update["parameter_update_norms"],
+            "norms_scope": "last update; updated_roles aggregates all updates",
+            "per_update": [{'iteration': n, 'gradient_norms': item['gradient_norms'],
+                            'parameter_update_norms': item['parameter_update_norms']}
+                           for n, item in enumerate(all_updates, 1)],
         },
     )
     test_count = 0
@@ -296,14 +318,16 @@ try:
                                         "preprocessing_skip": str(exc)})
                         continue
                     stage("rebuild_frozen_bank", task_id=task.id)
-                    e_record, candidates = rt.engine.extract(
-                        source, seed_for(cfg["seed"], "rebuild", task.id, "E"), deterministic=True
-                    )
-                    if candidates is not None:
-                        u_record, transaction, _ = rt.engine.update(
-                            source, bank, candidates,
-                            seed_for(cfg["seed"], "rebuild", task.id, "U"), deterministic=True
+                    with hf_attention_backend(attention_backend):
+                        e_record, candidates = rt.engine.extract(
+                            source, seed_for(cfg["seed"], "rebuild", task.id, "E"), deterministic=True
                         )
+                    if candidates is not None:
+                        with hf_attention_backend(attention_backend):
+                            u_record, transaction, _ = rt.engine.update(
+                                source, bank, candidates,
+                                seed_for(cfg["seed"], "rebuild", task.id, "U"), deterministic=True
+                            )
                         bank = transaction.bank
                         rebuild.append({"task_id": task.id, "E": e_record, "U": u_record,
                                         "valid_transaction": transaction.valid, "bank_hash": bank.hash})
@@ -337,10 +361,11 @@ try:
                 bank_hash = bank.hash
 
                 def read_test(turn):
-                    prepared = rt.engine.prepare_read(bank, turn)
-                    slate = rt.selector.sample(
-                        prepared, seed_for(cfg["seed"], "test", task.id), deterministic=True
-                    )
+                    with hf_attention_backend(attention_backend):
+                        prepared = rt.engine.prepare_read(bank, turn)
+                        slate = rt.selector.sample(
+                            prepared, seed_for(cfg["seed"], "test", task.id), deterministic=True
+                        )
                     reads.append({"turn": turn, "slate": slate, "bank_hash": bank.hash})
                     return slate
 
@@ -352,6 +377,11 @@ try:
                 if bank.hash != bank_hash:
                     raise ValueError("Frozen test changed the memory bank")
                 test_count += 1
+                atomic_json(root / 'frozen_test_progress.json', {
+                    'status': 'in_progress', 'reports': reports, 'bank_hash': bank.hash,
+                    'policy_version': version, 'parameters_updated': False,
+                    'test_memory_writes': 0, 'completed_tasks': test_count,
+                })
         after = adapter_state(rt.shared)
         if version != rt.shared.version or any(
             not torch.equal(before[role][key], after[role][key]) for role in before for key in before[role]

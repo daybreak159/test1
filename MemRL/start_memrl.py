@@ -69,7 +69,7 @@ def validate_files(cfg, base, checkpoint):
     return env
 
 
-def prepare(config_path, checkpoint, root):
+def prepare(config_path, checkpoint, root, recover_main_from=None):
     """Copy input manifests without modifying their bytes or historical files."""
     cfg = deepcopy(read_json(config_path))
     base = config_path.parent
@@ -101,6 +101,14 @@ def prepare(config_path, checkpoint, root):
     cfg['output_dir'], cfg['checkpoint_dir'] = str(root / 'rl'), str(root / 'checkpoints')
     cfg['e_preprocessing']['output_dir'] = str(root / 'e_preprocessing')
     cfg['e_preprocessing']['config'].update(max_input_tokens=32768, prompt_profile='e-text-v1')
+    if recover_main_from is not None:
+        old = recover_main_from.resolve()
+        cfg['main_recovery'] = {
+            'root': str(old), 'sft_checkpoint': str(checkpoint),
+            'sha256': {name: file_sha(old / name) for name in (
+                'config.json', 'executions.jsonl', 'grades.jsonl', 'generations.jsonl',
+                'memory_validation.jsonl', 'initialization.json', 'launch_provenance.json')},
+        }
     cfg['environment']['image_manifest'] = str(root / 'environment_config.json')
     env['grader']['artifact_root'], env['swe']['output_artifact_root'] = str(root / 'official_evaluator'), str(root / 'tool_outputs')
     for name, value in [('environment_config.json', env), ('config.json', cfg), ('effective_config.json', cfg)]:
@@ -323,6 +331,8 @@ def main():
     p.add_argument('--source-dir', type=Path, default=Path(__file__).resolve().parent)
     p.add_argument('--config', type=Path, help='完整配置；默认源码包configs/coding_hf.json')
     p.add_argument('--sft-checkpoint', type=Path, help='默认当前coding的E文本SFT权重')
+    p.add_argument('--recover-main-from', type=Path, help='从未更新的同策略运行恢复首个完整主组；局部分支全部重跑')
+    p.add_argument('--full-suite', action='store_true', help='完成全部训练组后重建只读记忆库并统一测试')
     directories = p.add_mutually_exclusive_group()
     directories.add_argument('--root', type=Path, help='新目录；已有目录拒绝使用')
     directories.add_argument('--prepared-root', type=Path, help='复用仅准备过的目录；不用于RL断点续训')
@@ -336,6 +346,8 @@ def main():
     mode.add_argument('--check', action='store_true', help='文件/依赖/GPU/Docker/实际模型API检查，不加载训练模型')
     mode.add_argument('--serve-environment', action='store_true', help='前台运行准备目录的环境服务')
     a = p.parse_args()
+    if a.full_suite and not a.train:
+        p.error('--full-suite需要--train')
     if a.environment_smoke and not a.check:
         p.error('--environment-smoke仅用于--check')
     if a.start_environment and (a.prepare_only or a.serve_environment):
@@ -351,6 +363,8 @@ def main():
     checkpoint = Path(a.sft_checkpoint).resolve() if a.sft_checkpoint else None
     root = a.prepared_root.resolve() if a.prepared_root else None
     if root:
+        if a.recover_main_from:
+            p.error('--recover-main-from只能用于创建新目录')
         if a.config:
             p.error('--prepared-root已确定配置，不能再指定--config')
         cfg, checkpoint = load_prepared(root, checkpoint)
@@ -369,7 +383,7 @@ def main():
         raise SystemExit(0 if report['ready'] else 1)
     if root is None:
         root = (a.root or RESULTS / 'runs/memrl' / ('hf-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).resolve()
-        cfg = prepare(config, checkpoint, root)
+        cfg = prepare(config, checkpoint, root, a.recover_main_from)
     print(f'独立运行目录：{root}', flush=True)
     if a.prepare_only:
         return
@@ -383,6 +397,8 @@ def main():
                '--sft-checkpoint', str(checkpoint), '--sft-weights-only']
     if not a.train:
         command.append('--startup-only')
+    if a.full_suite:
+        command.append('--full-suite')
     write_json(root / 'launch_command.json', {'command': command, 'train': a.train})
     with gpu_lock(cfg['architecture']['device']), environment_service(cfg, root, source, a.start_environment):
         report = run_checks(cfg, root, checkpoint, require_environment=a.train)

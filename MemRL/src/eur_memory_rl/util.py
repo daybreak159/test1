@@ -91,6 +91,6 @@ def retry_infrastructure(call, attempts: int = 3):
     for attempt in range(attempts):
         try:
             return call()
-        except InfrastructureError:
-            if attempt + 1 == attempts:
+        except InfrastructureError as exc:
+            if not getattr(exc, 'retryable', True) or attempt + 1 == attempts:
                 raise

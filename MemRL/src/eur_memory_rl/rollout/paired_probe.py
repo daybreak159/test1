@@ -47,6 +47,8 @@ class PairedProbe:
         reference=True,
         selector_mode="learned",
         scoring="paired",
+        execution_adapters=None,
+        pin_probe_backend=False,
     ):
         if min(I, J, L) < 2 or min(K, B) < 1:
             raise ValueError("Invalid nested sampling plan")
@@ -55,6 +57,8 @@ class PairedProbe:
         self.invalid_score, self.budget = invalid_score, budget or Budget(8, 8192, 120)
         self.retry_attempts, self.credit, self.use_reference = retry_attempts, credit, reference
         self.selector_mode, self.scoring = selector_mode, scoring
+        self.execution_adapters = tuple(execution_adapters or (adapter,))
+        self.pin_probe_backend, self.probe_lanes = pin_probe_backend, {}
 
     def select_probes(self, anchor, pool, seed):
         # Eligibility and fixed categories/fallback are decided before generating E candidates.
@@ -74,7 +78,29 @@ class PairedProbe:
                 eligible = [related, retention] + [p for p in eligible if p not in (related, retention)]
         return tuple(eligible[: self.K])
 
-    def _execute(self, task, slate, execution_id, seed):
+    def qualify_anchor(self, anchor, probes, minimum):
+        """Inspect the existing public bank before E/U sampling, without an R forward.
+
+        This is an opportunity check, not a guarantee of different sampled
+        actions or rewards after the candidate update.
+        """
+        from ..memory.render import MemoryRenderer
+        from ..policies.direct_choice import legal_mask
+
+        if type(minimum) is not int or minimum < 0:
+            raise ValueError('min_legal_candidates must be a nonnegative integer')
+        checks = []
+        for task in probes:
+            forward, _ = self.engine.prepare_read(anchor.bank, task.turns[0], fixed=True)
+            mask = legal_mask(forward.candidates, (), forward.scope, MemoryRenderer(),
+                              self.engine.selector.tokenizer, forward.token_budget)
+            checks.append({'task_id': task.id, 'legal_candidates': sum(mask),
+                           'candidate_ids': [e.id for e, legal in zip(forward.candidates, mask) if legal]})
+        return {'anchor_id': anchor.id, 'bank_hash': anchor.bank.hash,
+                'minimum': minimum, 'probes': checks,
+                'eligible': all(c['legal_candidates'] >= minimum for c in checks)}
+
+    def _execute(self, task, slate, execution_id, seed, adapter=None):
         if len(task.turns) != 1:
             raise ValueError("v3 local probes begin at one fixed external turn boundary")
         router = ExternalTurnRouter()
@@ -84,7 +110,7 @@ class PairedProbe:
             return result
 
         execution = retry_infrastructure(
-            lambda: self.adapter.run_consumer(task, execution_id, seed, read, self.budget),
+            lambda: (adapter or self.adapter).run_consumer(task, execution_id, seed, read, self.budget),
             self.retry_attempts,
         )
         self.engine.count("short_executions")
@@ -94,6 +120,25 @@ class PairedProbe:
         self.engine.count("environment_seconds", execution.environment_seconds)
         self.engine.count("monetary_cost", execution.monetary_cost)
         return execution
+
+    def _execute_batch(self, requests):
+        """Only frozen Solver work runs in threads; HF E/U/R remain serial.
+
+        Each endpoint has one lane and its own mutable HTTP client. Results are
+        collected in declaration order, independently of completion order.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        count = len(self.execution_adapters)
+        if count <= 1:
+            return [self._execute(*request, adapter=self.execution_adapters[0]) for request in requests]
+        def lane(index):
+            adapter = self.execution_adapters[index]
+            return [(n, self._execute(*requests[n], adapter=adapter))
+                    for n in range(len(requests))
+                    if self.probe_lanes.get(requests[n][0].id, n % count) == index]
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            results = dict(item for group in pool.map(lane, range(count)) for item in group)
+        return [results[n] for n in range(len(requests))]
 
     def run(self, anchor, probes, seed):
         if len(probes) != self.K or any(
@@ -106,17 +151,20 @@ class PairedProbe:
             raise GroupExcluded(f"Entire anchor tree excluded: {exc}") from exc
 
     def _run(self, anchor, probes, seed):
+        self.probe_lanes = ({task.id: q % len(self.execution_adapters) for q, task in enumerate(probes)}
+                            if self.pin_probe_backend else {})
         bank, rows, values, refs, executions, scores = anchor.bank, [], {}, {}, {}, {}
         base_hash = bank.hash
         banks = {}
         if self.use_reference:
+            requests, keys = [], []
             for q, task in enumerate(probes):
                 prepared = self.engine.prepare_read(bank, task.turns[0], fixed=True)
                 slate = self.engine.selector.sample(prepared, seed_for(seed, q), fixed=True)
                 for b in range(self.B):
-                    refs[q, b] = self._execute(
-                        task, slate, f"{anchor.id}/ref/{q}/{b}", seed_for(seed, "pair", q, b)
-                    )
+                    keys.append((q, b))
+                    requests.append((task, slate, f"{anchor.id}/ref/{q}/{b}", seed_for(seed, "pair", q, b)))
+            refs.update(zip(keys, self._execute_batch(requests)))
         row_context = dict(
             episode_id=anchor.episode_id,
             group_id=anchor.id,
@@ -153,13 +201,12 @@ class PairedProbe:
                     values[i, j] = None
                     continue
                 banks[i, j] = applied.bank
-                leaf = []
+                requests, jobs = [], []
                 for q, task in enumerate(probes):
                     # Exactly one forward for L independently sampled slates.
                     prepared = self.engine.prepare_read(
                         applied.bank, task.turns[0], fixed=self.selector_mode == "R0"
                     )
-                    local_values = []
                     for ell in range(self.L):
                         slate = self.engine.selector.sample(
                             prepared, seed_for(seed, "R", i, j, q, ell), fixed=self.selector_mode == "R0"
@@ -188,30 +235,25 @@ class PairedProbe:
                         )
                         if self.selector_mode != "R0":
                             rows.append(row)
-                        rewards = []
                         for b in range(self.B):
-                            execution = self._execute(
-                                task, slate, f"{row.id}/execution/{b}", seed_for(seed, "pair", q, b)
-                            )
-                            executions[(*key, b)] = execution
-                            if self.use_reference and self.scoring == "paired":
-                                score = retry_infrastructure(
-                                    lambda: self.quality(
-                                        task, execution, refs[q, b], seed_for(seed, "judge", *key, b)
-                                    ),
-                                    self.retry_attempts,
-                                )
-                                scores[(*key, b)] = score
-                                rewards.append(score.value)
-                            else:
-                                if not execution.completed:
-                                    raise ConfigurationError(
-                                        "Direct terminal quality requires complete rollouts; a probe cutoff is not failure"
-                                    )
-                                rewards.append(self.adapter.grade(task, execution).quality)
-                        local_values.append(mean(rewards))
-                    leaf.append(local_values)
-                values[i, j] = leaf
+                            requests.append((task, slate, f"{row.id}/execution/{b}", seed_for(seed, "pair", q, b)))
+                            jobs.append((q, task, key, b))
+                completed = self._execute_batch(requests)
+                rewards = {}
+                for (q, task, key, b), execution in zip(jobs, completed):
+                    executions[(*key, b)] = execution
+                    if self.use_reference and self.scoring == "paired":
+                        score = retry_infrastructure(
+                            lambda: self.quality(task, execution, refs[q, b], seed_for(seed, "judge", *key, b)),
+                            self.retry_attempts)
+                        scores[(*key, b)] = score
+                        value = score.value
+                    else:
+                        if not execution.completed:
+                            raise ConfigurationError('Direct terminal quality requires complete rollouts; a probe cutoff is not failure')
+                        value = self.adapter.grade(task, execution).quality
+                    rewards.setdefault(key, []).append(value)
+                values[i, j] = [[mean(rewards[i, j, q, ell]) for ell in range(self.L)] for q in range(self.K)]
         advantages = nested_advantages(values, self.I, self.J, self.K, self.L, self.invalid_score)
         for row in rows:
             m = row.metadata

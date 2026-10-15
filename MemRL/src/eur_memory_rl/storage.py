@@ -5,6 +5,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 from .util import atomic_json, digest, file_hash, plain, read_json
 
@@ -13,9 +14,11 @@ class ResourceLog:
     def __init__(self):
         self.values = defaultdict(float)
         self.started = time.perf_counter()
+        self.lock = Lock()
 
     def add(self, name, value):
-        self.values[name] += value
+        with self.lock:
+            self.values[name] += value
 
     @contextmanager
     def gpu_timer(self, device, category):

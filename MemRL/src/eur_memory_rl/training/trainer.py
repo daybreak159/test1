@@ -66,7 +66,13 @@ class Trainer:
                     tasks = [e.task for e in plan.events if e.task][: cfg["experiment"]["stream_length"]]
                     plan = rt.adapter.build_plan(plan.id, plan.scope, (), tasks, plan.split)
                 try:
-                    group = rt.stream.run_group(
+                    run_group = rt.stream.run_group
+                    if cfg.get('main_recovery') and self.main_batches == 0:
+                        if self.cursor != 1:
+                            raise ValueError('Main recovery supports only the first complete group')
+                        from ..data.recover_main import recover_main_group
+                        run_group = lambda *args: recover_main_group(rt, *args, cfg['main_recovery'])
+                    group = run_group(
                         plan,
                         cfg["global"]["replicas"],
                         seed_for(batch_seed, self.cursor),
@@ -75,11 +81,15 @@ class Trainer:
                     )
                 except GroupExcluded as exc:
                     exclusions.append({"group": plan.id, "reason": str(exc)})
-                    if len(exclusions) >= cfg["schedule"]["max_excluded_groups"]:
+                    if (cfg['schedule'].get('require_declared_plans', False)
+                            or len(exclusions) >= cfg["schedule"]["max_excluded_groups"]):
                         atomic_json(self.output / f"blocked-batch-{next_iteration}.json", exclusions)
                         raise RuntimeError("Exceeded predeclared infrastructure exclusion budget") from exc
                     continue
                 main.extend(group)
+            save_rollout(self.output / f'main-before-local-{next_iteration:06d}.json',
+                         main, [], [], rt.resources.snapshot(), exclusions)
+            qualifications = []
             if cfg["experiment"]["objective"] != "outcome_only" and cfg["local"]["anchors_per_replica"] > 0:
                 for episode in main:
                     # Anchor locations use only a seeded declared rule and prefix eligibility, never rewards.
@@ -93,11 +103,19 @@ class Trainer:
                             )
                         except ValueError:
                             continue  # Pre-candidate fixed fallback to the next eligible anchor.
+                        minimum = cfg['local'].get('min_legal_candidates', 0)
+                        if minimum:
+                            check = rt.probe.qualify_anchor(anchor, probes, minimum)
+                            qualifications.append(check)
+                            atomic_json(self.output / f'anchor-qualification-{next_iteration:06d}.json',
+                                        qualifications)
+                            if not check['eligible']:
+                                continue
                         selected.append((anchor, probes))
                         if len(selected) == cfg["local"]["anchors_per_replica"]:
                             break
                     if len(selected) < cfg["local"]["anchors_per_replica"]:
-                        raise ValueError("Insufficient prefix-validated anchors; fix the train probe plan")
+                        raise ValueError("Insufficient prefix-validated anchors with declared legal-choice opportunity; inspect anchor qualification")
                     for anchor, probes in selected:
                         try:
                             local.append(

@@ -40,6 +40,9 @@ class SWEEnvironment:
     full_backend_reset = True
 
     def __init__(self, payload, seed, service_config):
+        observation_profile = service_config.get('initial_observation_profile', 'long-list-v1')
+        if observation_profile not in {'long-list-v1', 'sorted-names-v2'}:
+            raise ConfigurationError('Unknown SWE initial observation profile')
         images = service_config["allowed_images"]
         image_key = payload["image_key"]
         if image_key not in images or "@sha256:" not in images[image_key]:
@@ -81,15 +84,21 @@ class SWEEnvironment:
             status = self._exec(["git", "status", "--porcelain"]).stdout
             if status or actual != self.base_commit:
                 raise InfrastructureError("Image repository must be clean at the pinned base commit")
-            self.state_hash = digest(
-                {
+            state_identity = {
                     "image": self.image,
                     "base_commit": actual,
                     "workdir": self.workdir,
                     "reset_profile": service_config["revision"],
                 }
-            )
-            self.observation = self._exec(["pwd"]).stdout + self._exec(["ls", "-la"]).stdout
+            if observation_profile != 'long-list-v1':
+                state_identity['initial_observation_profile'] = observation_profile
+            self.state_hash = digest(state_identity)
+            listing = (['env', 'LC_ALL=C', 'ls', '-1A'] if observation_profile == 'sorted-names-v2'
+                       else ['ls', '-la'])
+            self.observation = self._exec(["pwd"]).stdout + self._exec(listing).stdout
+            expected_observation = payload.get('expected_initial_observation_hash')
+            if expected_observation and digest(self.observation) != expected_observation:
+                raise InfrastructureError('Initial public observation differs from reset audit')
         except Exception:
             self.close()
             raise
