@@ -15,10 +15,13 @@ from eur_memory_rl.config import load_config, preflight
 p = argparse.ArgumentParser()
 p.add_argument("--root", type=Path, required=True)
 p.add_argument("--full-suite", action="store_true", help="Train declared batches and rebuild a frozen main-task bank")
+p.add_argument('--resume-checkpoint', type=Path, help='Restore same-protocol RL weights, optimizers, RNG and cursor')
 p.add_argument("--sft-checkpoint", type=Path, help="Continue the same E/U/R weights from a trusted SWE SFT checkpoint")
 p.add_argument("--sft-weights-only", action="store_true", help="Import SWE adapter weights into a new protocol, resetting optimizer and cursor")
 p.add_argument("--startup-only", action="store_true", help="Check model, runtime, 32K backward and HF sampling, then stop before task rollouts or optimizer updates")
 a = p.parse_args()
+if a.resume_checkpoint and (a.sft_checkpoint or a.sft_weights_only or a.startup_only):
+    p.error('RL resume cannot be combined with SFT initialization or startup-only')
 root = a.root
 started = time.monotonic()
 summary = {"status": "running", "completed_updates": 0}
@@ -71,7 +74,9 @@ try:
         raise ValueError(report["errors"])
     stage("runtime_loading")
     rt = Runtime(cfg)
-    if a.sft_checkpoint:
+    if a.resume_checkpoint:
+        initial = a.resume_checkpoint
+    elif a.sft_checkpoint:
         # Strict protocol/base/data checks are performed by Trainer.resume below.
         initial = a.sft_checkpoint
         manifest = json.loads((initial / "manifest.json").read_text())
@@ -89,9 +94,10 @@ try:
             {"cursor": 0, "main_batches": 0, "manifest_hash": rt.data.manifest_hash, "stage": "rl"},
             {"initialization": "fresh E/U/R LoRAs; no reused solver rollout or reward"},
         )
-    atomic_json(
-        root / "initialization.json", {"initial_checkpoint": str(initial), "sft": bool(a.sft_checkpoint)}
-    )
+    if not a.resume_checkpoint:
+        atomic_json(
+            root / "initialization.json", {"initial_checkpoint": str(initial), "sft": bool(a.sft_checkpoint)}
+        )
     trainer = Trainer(rt)
     trainer.resume(str(initial))
     stage("loaded_sft_model_audit")

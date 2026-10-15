@@ -335,6 +335,7 @@ def main():
     p.add_argument('--sft-checkpoint', type=Path, help='默认当前coding的E文本SFT权重')
     p.add_argument('--recover-main-from', type=Path, help='从未更新的同策略运行恢复首个完整主组；局部分支全部重跑')
     p.add_argument('--full-suite', action='store_true', help='完成全部训练组后重建只读记忆库并统一测试')
+    p.add_argument('--resume-checkpoint', type=Path, help='配合--prepared-root --train，从同协议完整RL checkpoint恢复优化器和游标')
     directories = p.add_mutually_exclusive_group()
     directories.add_argument('--root', type=Path, help='新目录；已有目录拒绝使用')
     directories.add_argument('--prepared-root', type=Path, help='复用仅准备过的目录；不用于RL断点续训')
@@ -350,6 +351,8 @@ def main():
     a = p.parse_args()
     if a.full_suite and not a.train:
         p.error('--full-suite需要--train')
+    if a.resume_checkpoint and (not a.prepared_root or not a.train or a.recover_main_from):
+        p.error('--resume-checkpoint需要--prepared-root --train，不能与主轨迹恢复混用')
     if a.environment_smoke and not a.check:
         p.error('--environment-smoke仅用于--check')
     if a.start_environment and (a.prepare_only or a.serve_environment):
@@ -394,21 +397,38 @@ def main():
         command = [sys.executable, '-m', 'eur_memory_rl', 'serve-environments',
                    str(root / 'environment_config.json'), '--host', url.hostname, '--port', str(url.port)]
         raise SystemExit(subprocess.call(command, cwd=source, env=subprocess_environment(source)))
-    ensure_unstarted(root)
-    command = [sys.executable, '-u', str(runner), '--root', str(root),
-               '--sft-checkpoint', str(checkpoint), '--sft-weights-only']
+    if not a.resume_checkpoint:
+        ensure_unstarted(root)
+    else:
+        resume = a.resume_checkpoint.resolve()
+        if not resume.is_relative_to(root / 'checkpoints'):
+            raise ValueError('RL恢复仅允许本运行目录的完整checkpoint')
+        manifest = read_json(resume / 'manifest.json')
+        if manifest['iteration'] < 1 or file_sha(resume / 'state.pt') != manifest['state_sha256']:
+            raise ValueError('需要完整且校验通过的RL checkpoint')
+        source_now = source_identity(source)
+        source_before = read_json(root / 'launch_provenance.json')['source']
+        if source_now['core_sha256'] != source_before['core_sha256']:
+            raise ValueError('源码已变更；不得把新源码静默混入原RL协议恢复')
+    command = [sys.executable, '-u', str(runner), '--root', str(root)]
+    if a.resume_checkpoint:
+        command += ['--resume-checkpoint', str(resume)]
+    else:
+        command += ['--sft-checkpoint', str(checkpoint), '--sft-weights-only']
     if not a.train:
         command.append('--startup-only')
     if a.full_suite:
         command.append('--full-suite')
-    write_json(root / 'launch_command.json', {'command': command, 'train': a.train})
+    command_name = ('resume-command-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.json'
+                    if a.resume_checkpoint else 'launch_command.json')
+    write_json(root / command_name, {'command': command, 'train': a.train})
     with gpu_lock(cfg['architecture']['device']), environment_service(cfg, root, source, a.start_environment):
         report = run_checks(cfg, root, checkpoint, require_environment=a.train)
         write_json(root / 'service_checks.json', report)
         if not report['ready']:
             raise RuntimeError(f'依赖或服务检查失败；查看{root / "service_checks.json"}')
         print(f'启动中；进度查看：{root / "launcher.log"}', flush=True)
-        with (root / 'launcher.log').open('w', encoding='utf-8') as log:
+        with (root / 'launcher.log').open('a' if a.resume_checkpoint else 'w', encoding='utf-8') as log:
             result = subprocess.run(command, env=subprocess_environment(source), cwd=source,
                                     stdout=log, stderr=subprocess.STDOUT)
     print(f'退出码：{result.returncode}；日志：{root / "launcher.log"}', flush=True)
