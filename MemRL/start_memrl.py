@@ -234,8 +234,8 @@ def run_checks(cfg, base, checkpoint, require_environment=True, exact_environmen
 
     check('docker_images', images)
 
-    def solver():
-        result = http_json(cfg['consumer']['base_url'].rstrip('/') + '/chat/completions', {
+    def solver(base_url=None):
+        result = http_json((base_url or cfg['consumer']['base_url']).rstrip('/') + '/chat/completions', {
             'model': cfg['consumer']['profile']['model'], 'messages': [{'role': 'user', 'content': 'Reply only OK.'}],
             'max_tokens': 8, 'temperature': 0, 'chat_template_kwargs': {'enable_thinking': False},
         }, cfg['consumer'].get('api_key_env'), timeout=60)
@@ -255,6 +255,8 @@ def run_checks(cfg, base, checkpoint, require_environment=True, exact_environmen
         return {'dimension': len(vector), 'norm': norm}
 
     check('solver_api', solver)
+    for index, endpoint in enumerate(cfg.get('local_solver_endpoints', []), 1):
+        check(f'solver_worker_{index}_api', lambda endpoint=endpoint: solver(endpoint))
     check('embedding_api', embedding)
     check('environment_api', lambda: check_environment(cfg, exact_environment), require_environment)
     if smoke:
