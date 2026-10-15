@@ -291,6 +291,12 @@ try:
     test_count = 0
     test_plans = [plan for plan in rt.data.plans if plan.split == "test"]
     if test_plans:
+        if cfg['environment'].get('readiness_mode') == 'per-group-v1':
+            from eur_memory_rl.data.environment_readiness import ensure_environments
+            from eur_memory_rl.config import resolved
+            environment = json.loads(resolved(cfg, cfg['environment']['image_manifest']).read_text())['swe']
+            ensure_environments([event.task for plan in test_plans for event in plan.events if event.task],
+                                environment, root / 'rl/environment_readiness.json')
         from eur_memory_rl.data.serde import bank as parse_bank
         from eur_memory_rl.training.checkpoint import adapter_state
         from eur_memory_rl.util import seed_for

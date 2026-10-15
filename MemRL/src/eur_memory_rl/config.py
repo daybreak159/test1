@@ -301,7 +301,10 @@ def preflight(cfg, mode="train", check_installed=False):
                     errors.append(f"Missing environment artifact: {key}")
                 elif key == "reset_audit":
                     audit = read_json(path)
-                    if not audit.get("passed") or not audit.get("complete_state_verified"):
+                    progressive = (cfg['environment'].get('readiness_mode') == 'per-group-v1'
+                                   and cfg['domain'] == 'swe' and audit.get('mode') == 'per-group-v1'
+                                   and bool(audit.get('declared_tasks')))
+                    if not progressive and (not audit.get("passed") or not audit.get("complete_state_verified")):
                         errors.append("Real complete-state paired reset audit has not passed")
     if cfg["grader"]["kind"] == "remote":
         require("grader.base_url")

@@ -58,6 +58,14 @@ class Trainer:
             main, local, exclusions = [], [], []
             while len(main) < cfg["schedule"]["plans_per_batch"] * cfg["global"]["replicas"]:
                 base_plan = plans[self.cursor % len(plans)]
+                if cfg['environment'].get('readiness_mode') == 'per-group-v1':
+                    from ..data.environment_readiness import ensure_environments
+                    main_tasks = [event.task for event in base_plan.events if event.task]
+                    main_ids = {task.id for task in main_tasks}
+                    related = [probe for probe in rt.data.probes
+                               if set(probe.probe_certificate.get('source_task_ids', ())) & main_ids]
+                    environment = read_json(resolved(cfg, cfg['environment']['image_manifest']))['swe']
+                    ensure_environments(main_tasks + related, environment, self.output / 'environment_readiness.json')
                 self.cursor += 1
                 plan = replace(base_plan, id=f"batch-{next_iteration}/draw-{self.cursor}/{base_plan.id}")
                 if "stream_length" in cfg["experiment"]:

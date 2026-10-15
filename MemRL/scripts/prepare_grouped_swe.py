@@ -10,6 +10,9 @@ import json
 import shutil
 import subprocess
 import sys
+import urllib.request
+import urllib.error
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
@@ -22,6 +25,33 @@ from eur_memory_rl.util import atomic_json, digest, file_hash, plain, read_json
 
 def lines(path):
     return [json.loads(s) for s in path.read_text().splitlines() if s.strip()]
+
+
+def resolve_digest(tag):
+    """Freeze the upstream index digest without downloading image layers."""
+    import re
+    repository = tag.rsplit(':', 1)[0]
+    url = 'https://docker.1ms.run/v2/' + repository + '/manifests/latest'
+    headers = {'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        response = opener.open(urllib.request.Request(url, headers=headers), timeout=30)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise
+        fields = dict(re.findall(r'(\w+)="([^"]+)"', exc.headers['WWW-Authenticate']))
+        realm = fields.pop('realm')
+        with opener.open(realm + '?' + urllib.parse.urlencode(fields), timeout=30) as response:
+            auth = json.load(response)
+        headers['Authorization'] = 'Bearer ' + (auth.get('token') or auth['access_token'])
+        response = opener.open(urllib.request.Request(url, headers=headers), timeout=30)
+    import hashlib
+    with response:
+        raw = response.read()
+        actual = 'sha256:' + hashlib.sha256(raw).hexdigest()
+        if response.headers.get('Docker-Content-Digest', actual) != actual:
+            raise ValueError('Registry manifest digest mismatch')
+    return repository + '@' + actual
 
 
 def validate_groups(spec, rows, train_ids, test_ids, sft_ids, component_by_id):
@@ -68,6 +98,8 @@ def main():
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--environment', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--deferred-environments', action='store_true',
+                        help='Freeze all image digests now; paired reset checks run before each group')
     args = parser.parse_args()
     spec, split = read_json(args.spec), read_json(args.split)
     pools = [r for path in args.public_pool for r in lines(path)]
@@ -93,6 +125,28 @@ def main():
         row = rows[iid]
         tag = 'swebench/sweb.eval.x86_64.' + iid.replace('__', '_1776_') + ':latest'
         inspected = subprocess.run(['docker', 'image', 'inspect', tag], capture_output=True, text=True)
+        if args.deferred_environments:
+            pinned = (next(v for v in json.loads(inspected.stdout)[0]['RepoDigests'] if v.startswith(tag.split(':')[0] + '@'))
+                      if not inspected.returncode else resolve_digest(tag))
+            env['allowed_images'][iid] = pinned
+            reset_hash = digest({'image': pinned, 'base_commit': row['base_commit'],
+                                 'workdir': env.get('repository_path', '/testbed'), 'reset_profile': env['revision'],
+                                 'initial_observation_profile': env['initial_observation_profile']})
+            payload = {'image_key': iid, 'base_commit': row['base_commit'], 'expected_initial_state_hash': reset_hash}
+            cert = {}
+            if roles[iid] == 'train_probe':
+                group = next(g for g in spec['groups'] if iid in g['probes'])
+                cert = {'prefix_answerable': True, 'validated_before_sampling': True, 'cutoff': 0,
+                        'validation_version': 'independent-public-issue-clean-reset-v2',
+                        'probe_kind': 'related' if iid == group['probes'][0] else 'retention',
+                        'source_task_ids': group['main'], 'reset_hash': reset_hash,
+                        'rationale': group['rationale'] + ' Public issue; paired reset is mandatory before group execution.'}
+            identity = DataIdentity('swe_bench', row['version'], 'verified30-five-4plus2-v1', roles[iid], iid,
+                                    assigned[iid], scope, (), (), 0, reset_hash, iid)
+            tasks[iid] = plain(Task(identity, (Turn(iid, iid + '/external-0', row['problem_statement'], public_time='2026-10-15'),),
+                                    payload, probe_certificate=cert))
+            print('PINNED', len(tasks), iid, 'cached' if not inspected.returncode else 'background-download', flush=True)
+            continue
         if inspected.returncode:
             if shutil.disk_usage(args.root).free < 32 * 1024**3:
                 raise RuntimeError('Less than 32GiB disk free before image pull')
@@ -148,7 +202,10 @@ def main():
                   'assignments': {'swe_bench:' + iid: c for iid, c in assigned.items()}}
     for name, value in [('public_manifest', manifest), ('duplicate_manifest', duplicates),
                         ('private_labels', {'labels': {}}), ('environment', envdoc),
-                        ('reset_audit', {'passed': True, 'complete_state_verified': True, 'records': records})]:
+                        ('reset_audit', {'passed': not args.deferred_environments,
+                                         'complete_state_verified': not args.deferred_environments,
+                                         'mode': 'per-group-v1' if args.deferred_environments else 'complete-v1',
+                                         'declared_tasks': list(tasks), 'records': records})]:
         atomic_json(args.root / (name + '.json'), value)
     cfg['schedule'].update(batches=5, plans_per_batch=1, dev_interval=100, require_declared_plans=True)
     cfg['experiment']['name'] = 'verified30-five-4plus2-hf-pg-v1'
@@ -156,6 +213,8 @@ def main():
     cfg['local_solver_endpoints'] = spec['local_solver_endpoints']
     cfg['judge'].update(structured_output=True, repair_attempts=2, rubric_version='eur-pair-public-evidence-schema-repair-v2')
     cfg['environment'].update(image_manifest=str(args.root / 'environment.json'), reset_audit=str(args.root / 'reset_audit.json'))
+    if args.deferred_environments:
+        cfg['environment']['readiness_mode'] = 'per-group-v1'
     for key in ('public_manifest', 'private_labels', 'duplicate_manifest'):
         cfg['data'][key] = str(args.root / (key + '.json'))
         cfg['data'][key + '_sha256'] = file_hash(Path(cfg['data'][key]))
