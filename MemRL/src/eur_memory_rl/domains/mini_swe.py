@@ -12,23 +12,11 @@ import time
 from ..contracts import Execution
 from ..util import ConfigurationError, InfrastructureError, atomic_json, digest, plain, seed_for
 from .base import DomainAdapter
+from .reasoningbank_prompts import SYSTEM, system_with_memory
 
-HARNESS_REVISION = "mini-swe-agent-bash-v1-memrl-bridge-v1"
+HARNESS_REVISION = "mini-swe-agent-reasoningbank-prompts-v2-memrl-bridge-v1"
 DEFAULT_PYTHON = "/home/ubuntu/coding/venvs/swebench/bin/python"
 WORKER = Path(__file__).with_name("mini_swe_worker.py")
-SYSTEM = """You are a software engineer resolving an issue in a repository.
-Inspect the relevant code, reproduce the problem when practical, make a focused
-fix to non-test source files, and verify it with relevant checks. Do not modify
-tests or evaluation configuration to make a failure disappear.
-Each response must contain exactly ONE bash code block with the command to run.
-You may briefly explain your next action before the code block. Commands run
-in independent shells in /testbed; use cd or environment variables explicitly
-when needed. Use the tool observations as evidence, not your own claims.
-When finished, submit by running this command in a bash code block:
-echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-Submission ends your execution; the frozen grader evaluates the actual patch.
-Reference memories below may help, but must be checked against this repository.
-"""
 
 
 def configure_swe_runner(cfg):
@@ -114,8 +102,8 @@ class MiniSWEAdapter(DomainAdapter):
                 # Never turn an untrusted execution_id into a filesystem path.
                 self.trajectory_dir.mkdir(parents=True, exist_ok=True)
                 trajectory_path = str(self.trajectory_dir / (digest(execution_id) + ".traj.json"))
-            payload = {"task": turn.public_history + "\n" + turn.text + "\nInitial observation:\n"
-                       + str(environment.observation), "system_prompt": SYSTEM + "\n" + slate.memory_block,
+            payload = {"task": (turn.public_history + "\n" if turn.public_history else "") + turn.text,
+                       "system_prompt": system_with_memory(slate.memory_block),
                        "model_calls": budget.model_calls, "trajectory_path": trajectory_path,
                        "max_consecutive_format_errors": self.max_consecutive_format_errors,
                        "provenance": {"execution_id": execution_id, "task_id": task.id,

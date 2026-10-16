@@ -295,6 +295,12 @@ try:
                     task = parse_task(event["task"])
                     saved = episode["executions"][task.id]
                     execution = Execution(**{**saved, "public_trace": tuple(saved["public_trace"])})
+                    replay = cfg.get("first_task_replay_by_task", {}).get(task.id)
+                    if replay:
+                        # Earlier groups ran in separate processes; reload the
+                        # pinned public trace rather than relying on RAM cache.
+                        from eur_memory_rl.data.replay_swe import load_replay_trace
+                        rt.hybrid_processor.replayed_traces[execution.execution_id] = load_replay_trace(task, replay)[0]
                     from eur_memory_rl.contracts import Grade
                     from eur_memory_rl.data.hybrid_trace import CompactionSkip
                     try:

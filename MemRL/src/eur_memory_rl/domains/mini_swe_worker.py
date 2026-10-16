@@ -9,6 +9,7 @@ import contextlib
 import json
 import sys
 from pathlib import Path
+from reasoningbank_prompts import INSTANCE, OBSERVATION, FORMAT_ERROR
 
 
 def send(value):
@@ -79,8 +80,7 @@ def main():
                         "extra": {"interrupt_type": "FormatError"}})
                 message["extra"]["actions"] = parse_actions(
                     reply["text"], action_regex=r"```bash\s*\n(.*?)\n```",
-                    format_error_template=("Provide exactly ONE bash code block; found {{actions|length}}. "
-                        "To submit, run: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"),
+                    format_error_template=FORMAT_ERROR,
                     template_kwargs={"finish_reason": reply["finish_reason"]})
             except FormatError as exc:
                 # Keep billed/empty/malformed responses in the native trajectory.
@@ -89,8 +89,7 @@ def main():
             return message
 
         def format_observation_messages(self, message, outputs, template_vars=None):
-            return format_observations(outputs, observation_template=(
-                "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"),
+            return format_observations(outputs, observation_template=OBSERVATION,
                 template_vars=template_vars)
 
     class BridgeEnvironment:
@@ -117,7 +116,7 @@ def main():
     output = config.get("trajectory_path")
     agent = AuditedAgent(
         BridgeModel(), BridgeEnvironment(), system_template="{{ memrl_system }}",
-        instance_template="{{ task }}", step_limit=config["model_calls"], cost_limit=0,
+        instance_template=INSTANCE, step_limit=config["model_calls"], cost_limit=0,
         # Exact wall/token/command budgets are enforced by the parent bridge.
         max_consecutive_format_errors=config["max_consecutive_format_errors"],
         output_path=Path(output) if output else None)

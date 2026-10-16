@@ -23,7 +23,8 @@ def validate_replay_map(cfg, manifest):
             raise ValueError("Pinned no-memory trajectory changed")
 
 
-def replay_first_execution(runtime, task, execution_id, seed, read, replay):
+def load_replay_trace(task, replay):
+    """Also used after process restart when rebuilding the final frozen bank."""
     if task.id != replay["task_id"] or task.identity.split != "train":
         raise ValueError("Replay is restricted to the declared first training task")
     path = Path(replay["trajectory"])
@@ -41,6 +42,12 @@ def replay_first_execution(runtime, task, execution_id, seed, read, replay):
     reset = read_json(path.parent / "reset_check.json")
     if reset["base_commit"] != task.public_payload["base_commit"]:
         raise ValueError("No-memory replay base commit mismatch")
+    return trace, reset
+
+
+def replay_first_execution(runtime, task, execution_id, seed, read, replay):
+    trace, reset = load_replay_trace(task, replay)
+    path = Path(replay["trajectory"])
     slate = read(task.turns[0])
     if slate.memory_block.strip():
         # An empty renderer may include a fixed empty-bank declaration.
