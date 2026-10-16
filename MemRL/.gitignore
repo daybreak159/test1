@@ -1,16 +1,83 @@
+# Source-only GitHub scope. Tracked files and old commits are not removed by
+# ignore rules; the initial history import must use the agreed source allowlist.
+
+# Python environments, caches and build products.
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-.test-tmp/
-outputs/
-releases/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+/.test-tmp/
+/.venv/
+/venv/
+/build/
+/dist/
+*.egg-info/
+
+# Development scratch space: only its guide is versioned.
+/_dev/*
+!/_dev/README.md
+
+# Local data, model assets and experiment/deployment outputs.
+/data/
+/cache/
+/runs/
+/outputs/
+/results/
+/checkpoints/
+/models/
+/logs/
+/diagnostics/
+/releases/
+/01_部署与配置/
+/03_实验结果/
+/configs
+/使用说明.md
 *.log
 *.pt
+*.pth
+*.ckpt
 *.safetensors
+*.onnx
+*.zip
+*.tar
 *.tar.gz
+*.tgz
+*.bak
+*.bak-*
+
+# Tests and historical baseline material stay local for this source handoff.
+/tests/
+/baselines/
+
+# Only the agreed training and preprocessing entry points are included.
+/scripts/*
+!/scripts/memrl.sh
+!/scripts/run_hf_orm.py
+!/scripts/run_text_e_sft.py
+!/scripts/run_u_sft.py
+!/scripts/compact_swe_hybrid.py
+!/scripts/verify_swe_hybrid_outputs.py
+!/scripts/prepare_grouped_swe.py
+!/scripts/fork_continuous_memory.py
+
+# Credentials and machine-local settings.
 .env
+.env.*
+!.env.example
 auth.json
+*.pem
+*.key
 *private_key*
-configs
-使用说明.md
+/config.local.*
+/configs.local/
+
+# Editor and OS metadata.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
