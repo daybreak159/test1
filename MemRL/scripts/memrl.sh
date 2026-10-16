@@ -16,5 +16,10 @@ if (( task_nofile_soft < task_nofile_target )); then
   ulimit -Sn "$task_nofile_target"
 fi
 echo "MemRL process open-file limit: $(ulimit -Sn)"
+if [[ "${1:-}" == "--u-sft" ]]; then
+  shift
+  exec /home/ubuntu/coding/venvs/eur-alf-pilot-20261011/bin/python \
+    "$task_source/scripts/run_u_sft.py" "$@"
+fi
 exec /home/ubuntu/coding/venvs/eur-alf-pilot-20261011/bin/python \
   "$task_source/start_memrl.py" "$@"
