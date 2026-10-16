@@ -147,10 +147,7 @@ try:
         return result
 
     rt.engine.update = managed
-    original_consumer = rt.adapter.run_consumer
-
-    def consumed(task, execution_id, seed, read, budget=None):
-        stage("consumer", task_id=task.id, execution_id=execution_id)
+    def replayed(task, execution_id, seed, read, budget=None):
         replay = cfg.get("first_task_replay")
         if replay and task.id == replay["task_id"] and task.identity.split == "train":
             from eur_memory_rl.data.replay_swe import replay_first_execution
@@ -158,46 +155,18 @@ try:
             record("reused_executions", {"execution_id": execution_id, "source": replay,
                 "solver_calls_this_run": 0, "reward_source": "new official evaluation of actual historical patch",
                 "acceptance_only": True, "not_on_policy_solver_rollout": True})
-        else:
-            result = original_consumer(task, execution_id, seed, read, budget)
-        record("executions", {"execution": result, "task_identity": task.identity})
-        return result
-
-    rt.adapter.run_consumer = consumed
-    for worker_index, adapter in enumerate(rt.local_adapters[1:], 1):
-        worker_run = adapter.run_consumer
-        def worker_consumed(task, execution_id, seed, read, budget=None,
-                            _run=worker_run, _index=worker_index):
-            stage('consumer', task_id=task.id, execution_id=execution_id, solver_worker=_index)
-            result = _run(task, execution_id, seed, read, budget)
-            record('executions', {'execution': result, 'task_identity': task.identity, 'solver_worker': _index})
             return result
-        adapter.run_consumer = worker_consumed
-    original_grade = rt.adapter.grade
+        return None
 
-    def graded(task, execution):
-        from dataclasses import replace
+    from eur_memory_rl.rollout.solver_audit import install_solver_audit
 
-        result = original_grade(task, execution)
-        if execution.finish_reason != "submitted":
-            record(
-                "budget_grade_adjustments",
-                {
-                    "execution_id": execution.execution_id,
-                    "finish_reason": execution.finish_reason,
-                    "raw_official_grade": result,
-                    "effective_quality": 0.0,
-                },
-            )
-            result = replace(
-                result,
-                quality=0.0,
-                metrics={**result.metrics, "raw_official_resolved": result.quality, "resolved": 0.0},
-            )
-        record("grades", {"task_id": task.id, "execution_id": execution.execution_id, "grade": result})
-        return result
-
-    rt.adapter.grade = graded
+    install_solver_audit(rt.local_adapters, record, stage, replay=replayed)
+    atomic_json(root / "solver_parallelism.json", {
+        "main_parallel_workers": rt.stream.main_parallel_workers,
+        "endpoints": [adapter.consumer.client.base_url for adapter in rt.local_adapters],
+        "hf_policy_calls_serialized": True,
+        "update_barrier": "all main replicas and selected local trees completed",
+    })
     stage("long_input_precheck")
     # Only a scoring/backward capacity check; no synthetic optimizer update.
     from eur_memory_rl.contracts import GenerationRecord

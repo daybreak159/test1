@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager, nullcontext
+from threading import RLock
 
 from ..contracts import PolicyRow
 from ..memory.recall import FrozenIndex
@@ -23,6 +25,7 @@ class MemoryEngine:
         management_query_tokens=2048,
         resource_log=None,
         source_packing="reject",
+        policy_context_factory=None,
     ):
         self.generator, self.selector, self.transactions = generator, selector, transactions
         self.embedder, self.instructions = embedder, instructions
@@ -31,6 +34,14 @@ class MemoryEngine:
         self.resource_log = resource_log
         self.source_packing = source_packing
         self._indexes = {}
+        self._policy_lock = RLock()
+        self._policy_context_factory = policy_context_factory or nullcontext
+
+    @contextmanager
+    def policy_context(self):
+        """Serialize HF/tokenizer/index access and enter worker-local kernels."""
+        with self._policy_lock, self._policy_context_factory():
+            yield
 
     def count(self, name, amount=1):
         if self.resource_log:

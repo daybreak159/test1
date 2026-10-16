@@ -132,8 +132,10 @@ def configure_solver(cfg):
     if source_src not in sys.path:
         sys.path.insert(0, source_src)
     from eur_memory_rl.domains.mini_swe import configure_swe_runner
+    from eur_memory_rl.config import validate_solver_parallelism
 
     configure_swe_runner(cfg)
+    validate_solver_parallelism(cfg)
 
 
 def source_identity(source):
@@ -185,6 +187,9 @@ def check_environment(cfg, exact=True):
         raise ValueError('端口监听者不是新版MemRL环境服务')
     if exact and result.get('config_fingerprint') != fingerprint(read_json(Path(cfg['environment']['image_manifest']))):
         raise ValueError('环境服务配置与本轮不匹配；请使用本轮environment_config.json启动')
+    if cfg.get('global', {}).get('main_parallel_workers', 1) > 1:
+        if result.get('concurrency_protocol') != 'per-execution-v1':
+            raise ValueError('旧环境服务不支持独立任务并行；请用新源码启动本轮环境服务')
     return result
 
 
@@ -227,8 +232,11 @@ def run_checks(cfg, base, checkpoint, require_environment=True, exact_environmen
     check('files_and_manifest_hashes', lambda: bool(validate_files(cfg, base, checkpoint)))
     check('dependencies', lambda: {name: importlib.metadata.version(name) for name in
                                   ('torch', 'transformers', 'peft', 'fastapi', 'uvicorn', 'causal-conv1d')})
+    configure_solver(cfg)
+    from eur_memory_rl.config import validate_solver_parallelism
+
+    check('solver_parallelism', lambda: validate_solver_parallelism(cfg))
     if cfg.get('domain') == 'swe':
-        configure_solver(cfg)
         from eur_memory_rl.domains.mini_swe import check_worker
 
         check('mini_swe_agent', lambda: check_worker(cfg['consumer']['mini_swe']['python']))

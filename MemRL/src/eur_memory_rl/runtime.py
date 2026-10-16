@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .config import protocol_hash, require_hf_backend, resolved
+from .config import protocol_hash, require_hf_backend, resolved, validate_solver_parallelism
 from .contracts import Budget, ConsumerProfile
 from .data.manifest import audit_manifests, load_manifest
 from .domains.alf import ALFAdapter
@@ -81,6 +81,7 @@ class Runtime:
     def __init__(self, cfg, with_optimizer=True):
         configure_swe_runner(cfg)
         require_hf_backend(cfg)
+        validate_solver_parallelism(cfg)
         if cfg["domain"] == "swe":
             check_worker(cfg["consumer"]["mini_swe"]["python"])
         import random
@@ -132,6 +133,18 @@ class Runtime:
         else:
             self.embedder = QwenEmbedder(r["model"], r["revision"], r["device"], r["max_tokens"], r["batch_size"])
         self.embedder.resources = self.resources
+        from contextlib import contextmanager
+
+        @contextmanager
+        def policy_context():
+            # Autograd/attention contexts are not inherited by executor threads.
+            from .training.attention import hf_attention_backend
+
+            with hf_attention_backend(cfg["runtime"].get("hf_attention_backend", "efficient")):
+                yield
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.shared.device)
+
         self.engine = MemoryEngine(
             self.generator,
             self.selector,
@@ -143,6 +156,7 @@ class Runtime:
             r["management_query_tokens"],
             self.resources,
             cfg.get("source_packing", "reject"),
+            policy_context_factory=policy_context,
         )
         self.adapter = make_adapter(cfg, self.resources)
         if cfg.get("e_preprocessing", {}).get("profile") == "swe-evidence-hybrid-v1":
@@ -165,7 +179,6 @@ class Runtime:
         self.data_audit = audit_manifests([self.data], resolved(cfg, cfg["data"]["duplicate_manifest"]))
         global_args = {k: v for k, v in cfg["global"].items() if k not in {"replicas", "debug_zero_baseline"}}
         retry = cfg["runtime"]["retry_attempts"]
-        self.stream = MainStream(self.engine, self.adapter, **global_args, retry_attempts=retry)
         j = cfg["judge"]
         judge = (
             PairJudge(
@@ -198,6 +211,8 @@ class Runtime:
             worker_cfg = deepcopy(cfg)
             worker_cfg['consumer']['base_url'] = url
             self.local_adapters.append(make_adapter(worker_cfg, self.resources))
+        self.stream = MainStream(self.engine, self.adapter, **global_args, retry_attempts=retry,
+                                 execution_adapters=self.local_adapters)
         local = {k: v for k, v in cfg["local"].items()
                  if k not in {"beta", "anchors_per_replica", "budget", "min_legal_candidates"}}
         reference = cfg["experiment"].get("old_reference", True)

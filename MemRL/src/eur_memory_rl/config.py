@@ -66,6 +66,7 @@ def starter_config(domain):
         },
         "global": {
             "replicas": 2,
+            "main_parallel_workers": 1,
             "cost_lambda": 0.01,
             "bad_write_lambda": 1.0,
             "cost_budget": 100000,
@@ -186,6 +187,24 @@ def require_hf_backend(cfg):
         raise ConfigurationError("optimization.policy_loss must be single_step_pg or ppo")
 
 
+def validate_solver_parallelism(cfg):
+    workers = cfg.get("global", {}).get("main_parallel_workers", 1)
+    if type(workers) is not int or workers < 1:
+        raise ConfigurationError("global.main_parallel_workers must be a positive integer")
+    endpoints = [cfg.get("consumer", {}).get("base_url"), *cfg.get("local_solver_endpoints", [])]
+    if workers > 1:
+        if cfg.get("domain") != "swe":
+            raise ConfigurationError("Parallel main streams are currently SWE-only")
+        if any(not isinstance(url, str) or not url.strip() for url in endpoints):
+            raise ConfigurationError("Each parallel Solver needs an explicit endpoint")
+    canonical = [url.strip().rstrip("/") for url in endpoints if isinstance(url, str) and url.strip()]
+    if len(set(canonical)) != len(canonical):
+        raise ConfigurationError("Duplicate Solver endpoint; each lane needs its own service")
+    if workers > 1 and workers > len(canonical):
+        raise ConfigurationError("main_parallel_workers exceeds the number of Solver endpoints")
+    return {"main_parallel_workers": workers, "solver_endpoints": canonical}
+
+
 def load_config(path):
     cfg = read_json(path)
     if cfg.get("schema_version") != "eur-runtime-v3.2":
@@ -205,6 +224,7 @@ def load_config(path):
     from .domains.mini_swe import configure_swe_runner
 
     configure_swe_runner(cfg)
+    validate_solver_parallelism(cfg)
     return cfg
 
 
@@ -226,6 +246,11 @@ def protocol_hash(cfg):
 
 def preflight(cfg, mode="train", check_installed=False):
     errors, checks = [], []
+    try:
+        validate_solver_parallelism(cfg)
+        checks.append("solver_parallelism")
+    except ConfigurationError as exc:
+        errors.append(str(exc))
 
     def require(path, predicate=bool, explanation="must be configured"):
         value = cfg

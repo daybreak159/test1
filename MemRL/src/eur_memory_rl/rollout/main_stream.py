@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from ..contracts import Anchor, Bank, EpisodeResult
 from ..rewards.advantages import assign_main_advantages
 from ..rewards.outcome import RewardLedger
@@ -10,15 +12,31 @@ from .events import ExternalTurnRouter
 
 class MainStream:
     def __init__(
-        self, engine, adapter, cost_lambda=0.01, bad_write_lambda=1.0, cost_budget=100000, retry_attempts=3
+        self, engine, adapter, cost_lambda=0.01, bad_write_lambda=1.0, cost_budget=100000, retry_attempts=3,
+        main_parallel_workers=1, execution_adapters=None,
     ):
         self.engine, self.adapter = engine, adapter
         self.cost_lambda, self.bad_write_lambda = cost_lambda, bad_write_lambda
         self.cost_budget, self.retry_attempts = cost_budget, retry_attempts
+        self.main_parallel_workers = main_parallel_workers
+        self.execution_adapters = tuple(execution_adapters or (adapter,))
+        if type(main_parallel_workers) is not int or not 1 <= main_parallel_workers <= len(self.execution_adapters):
+            raise ValueError("main_parallel_workers needs one independent adapter per worker")
+        if len({id(a) for a in self.execution_adapters}) != len(self.execution_adapters):
+            raise ValueError("Solver workers must not share a mutable adapter/client")
+        if any(a.profile.hash != adapter.profile.hash for a in self.execution_adapters):
+            raise ValueError("Parallel Solver profiles must match")
+        if main_parallel_workers > 1 and not hasattr(engine, "policy_context"):
+            raise ValueError("Parallel main streams require an engine policy_context lock")
+
+    def policy_context(self):
+        return self.engine.policy_context() if hasattr(self.engine, "policy_context") else nullcontext()
 
     def run_episode(
-        self, plan, execution_id, seed, deterministic=False, selector_mode="learned", memory_enabled=True
+        self, plan, execution_id, seed, deterministic=False, selector_mode="learned", memory_enabled=True,
+        adapter=None,
     ):
+        adapter = adapter or self.adapter
         bank, router = Bank(plan.scope), ExternalTurnRouter()
         ledger = RewardLedger(
             plan.scored_count, plan.write_count, self.cost_lambda, self.bad_write_lambda, self.cost_budget
@@ -42,8 +60,9 @@ class MainStream:
                     provider = getattr(self.adapter, "memory_source", None)
                     from ..data.hybrid_trace import CompactionSkip
                     try:
-                        source = (provider(task, executions[event.source_from_task], grades[event.source_from_task])
-                                  if provider else self.adapter.public_source(task, executions[event.source_from_task]))
+                        with self.policy_context():
+                            source = (provider(task, executions[event.source_from_task], grades[event.source_from_task])
+                                      if provider else self.adapter.public_source(task, executions[event.source_from_task]))
                     except CompactionSkip:
                         # Preprocessing exclusion is neither a sampled invalid
                         # model write nor a model training example.
@@ -51,9 +70,10 @@ class MainStream:
                         continue
                 anchor_id = f"{execution_id}/{event.id}"
                 anchors.append(Anchor(anchor_id, execution_id, source, bank, event.id, at))
-                e_record, candidates = self.engine.extract(
-                    source, seed_for(seed, event.id, "E"), deterministic
-                )
+                with self.policy_context():
+                    e_record, candidates = self.engine.extract(
+                        source, seed_for(seed, event.id, "E"), deterministic
+                    )
                 e_row = policy_row(
                     e_record,
                     "E",
@@ -70,9 +90,10 @@ class MainStream:
                 if candidates is None:
                     ledger.bad_write(event.id, at + 1)
                     continue
-                u_record, result, metadata = self.engine.update(
-                    source, bank, candidates, seed_for(seed, event.id, "U"), deterministic
-                )
+                with self.policy_context():
+                    u_record, result, metadata = self.engine.update(
+                        source, bank, candidates, seed_for(seed, event.id, "U"), deterministic
+                    )
                 rows.append(
                     policy_row(
                         u_record,
@@ -105,13 +126,14 @@ class MainStream:
                         raise ValueError("Unplanned external input cannot be aligned across replicas")
 
                     def choose():
-                        prepared = self.engine.prepare_read(bank, turn, fixed=selector_mode == "R0")
-                        return self.engine.selector.sample(
-                            prepared,
-                            seed_for(seed, position, "R"),
-                            deterministic=deterministic,
-                            fixed=selector_mode == "R0",
-                        )
+                        with self.policy_context():
+                            prepared = self.engine.prepare_read(bank, turn, fixed=selector_mode == "R0")
+                            return self.engine.selector.sample(
+                                prepared,
+                                seed_for(seed, position, "R"),
+                                deterministic=deterministic,
+                                fixed=selector_mode == "R0",
+                            )
 
                     slate, fresh = router.read(task_execution, turn, choose)
                     if fresh:
@@ -150,7 +172,7 @@ class MainStream:
                                         "external_turn_id": turn.external_turn_id,
                                         "event_origin": turn.event_origin,
                                         "request_id": turn.request_id,
-                                        "harness_version": self.adapter.profile.harness_revision,
+                                        "harness_version": adapter.profile.harness_revision,
                                         "active_memory_block_hash": digest(slate.memory_block),
                                     },
                                 )
@@ -158,12 +180,12 @@ class MainStream:
                     return slate
 
                 result = retry_infrastructure(
-                    lambda: self.adapter.run_consumer(
+                    lambda: adapter.run_consumer(
                         task, task_execution, seed_for(seed, event.id, "consumer"), read
                     ),
                     self.retry_attempts,
                 )
-                grade = retry_infrastructure(lambda: self.adapter.grade(task, result), self.retry_attempts)
+                grade = retry_infrastructure(lambda: adapter.grade(task, result), self.retry_attempts)
                 executions[task.id], grades[task.id] = result, grade
                 ledger.outcome(task.id, at + 9999, grade.quality, result.raw_cost + read_cost[0])
                 self.engine.count("full_executions")
@@ -183,15 +205,31 @@ class MainStream:
             raise ValueError("P=1 is only allowed with an explicit debug zero baseline")
         episodes = []
         try:
-            for p in range(replicas):
-                episodes.append(
-                    self.run_episode(
-                        plan,
-                        f"{plan.id}/replica-{p}",
-                        seed_for(seed, "replica", p),
-                        selector_mode=selector_mode,
+            if self.main_parallel_workers == 1:
+                for p in range(replicas):
+                    episodes.append(
+                        self.run_episode(
+                            plan,
+                            f"{plan.id}/replica-{p}",
+                            seed_for(seed, "replica", p),
+                            selector_mode=selector_mode,
+                        )
                     )
-                )
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                count = min(self.main_parallel_workers, replicas)
+
+                def lane(index):
+                    return [(p, self.run_episode(plan, f"{plan.id}/replica-{p}", seed_for(seed, "replica", p),
+                             selector_mode=selector_mode, adapter=self.execution_adapters[index]))
+                            for p in range(index, replicas, count)]
+
+                # One lane owns one endpoint/client. Joining all lanes is the
+                # barrier before local sampling, advantages and optimizer.step.
+                with ThreadPoolExecutor(max_workers=count, thread_name_prefix="main-solver") as pool:
+                    ordered = dict(item for group in pool.map(lane, range(count)) for item in group)
+                episodes = [ordered[p] for p in range(replicas)]
         except InfrastructureError as exc:
             raise GroupExcluded(f"Entire main replica group excluded: {exc}") from exc
         assign_main_advantages(episodes, debug_zero_baseline)
