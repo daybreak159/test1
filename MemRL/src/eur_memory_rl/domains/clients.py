@@ -40,6 +40,8 @@ class Completion:
     input_tokens: int
     output_tokens: int
     monetary_cost: float = 0.0
+    finish_reason: str = "stop"
+    reasoning: str = ""
 
 
 class ChatModel:
@@ -103,7 +105,7 @@ class ChatModel:
                 self.resources.add(f"{self.usage_role}_api_input_tokens", ni)
                 self.resources.add(f"{self.usage_role}_api_output_tokens", no)
                 self.resources.add("observed_api_monetary_cost", cost)
-            return Completion(text, ni, no, cost)
+            return Completion(text, ni, no, cost, choice.get("finish_reason", "stop"), reasoning or "")
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise InfrastructureError("Malformed completion or missing token usage") from exc
 

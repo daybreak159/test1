@@ -8,6 +8,7 @@ from .domains.clients import ChatModel, JSONClient, RemoteGrader
 from .domains.offline_web import OfflineWebAdapter, OfflineWebGrader
 from .domains.qa import AnswerGrader, QAAdapter
 from .domains.swe import SWEAdapter
+from .domains.mini_swe import check_worker, configure_swe_runner
 from .domains.web import WebAdapter
 from .memory.recall import QwenEmbedder, RemoteQwenEmbedder
 from .memory.transaction import TransactionExecutor
@@ -25,6 +26,7 @@ from .util import read_json
 
 
 def make_adapter(cfg, resources=None):
+    configure_swe_runner(cfg)
     c = cfg["consumer"]
     p = c["profile"]
     profile = ConsumerProfile(**{**p, "budget": Budget(**p["budget"]), "tools": tuple(p["tools"])})
@@ -62,7 +64,13 @@ def make_adapter(cfg, resources=None):
         "alf": ALFAdapter,
         "offline_web": OfflineWebAdapter,
     }[cfg["domain"]]
-    adapter = cls(consumer, profile, grader, environment)
+    options = {}
+    if cfg["domain"] == "swe":
+        settings = c["mini_swe"]
+        options = {"worker_python": settings["python"],
+                   "max_consecutive_format_errors": settings["max_consecutive_format_errors"],
+                   "trajectory_dir": resolved(cfg, cfg["output_dir"]) / "solver_trajectories"}
+    adapter = cls(consumer, profile, grader, environment, **options)
     adapter.official_outcome_feedback = cfg.get("memory_feedback", {}).get("protocol") == "swe-official-outcome-v1"
     if adapter.official_outcome_feedback and cfg["domain"] != "swe":
         raise ValueError("Scalar official outcome feedback is SWE-specific")
@@ -71,7 +79,10 @@ def make_adapter(cfg, resources=None):
 
 class Runtime:
     def __init__(self, cfg, with_optimizer=True):
+        configure_swe_runner(cfg)
         require_hf_backend(cfg)
+        if cfg["domain"] == "swe":
+            check_worker(cfg["consumer"]["mini_swe"]["python"])
         import random
         import torch
         from transformers import AutoTokenizer

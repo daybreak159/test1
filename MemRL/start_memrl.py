@@ -72,6 +72,7 @@ def validate_files(cfg, base, checkpoint):
 def prepare(config_path, checkpoint, root, recover_main_from=None):
     """Copy input manifests without modifying their bytes or historical files."""
     cfg = deepcopy(read_json(config_path))
+    configure_solver(cfg)
     base = config_path.parent
     env = validate_files(cfg, base, checkpoint)
     root.mkdir(parents=True, exist_ok=False)
@@ -121,6 +122,18 @@ def prepare(config_path, checkpoint, root, recover_main_from=None):
         'note': 'HF only; fresh optimizer/bank/cursor; budgets and dataset preserved; replay disabled',
     })
     return cfg
+
+
+def configure_solver(cfg):
+    """Use the same effective Solver protocol as Runtime, before hashing."""
+    if cfg.get('domain') != 'swe':
+        return
+    source_src = str(Path(__file__).resolve().parent / 'src')
+    if source_src not in sys.path:
+        sys.path.insert(0, source_src)
+    from eur_memory_rl.domains.mini_swe import configure_swe_runner
+
+    configure_swe_runner(cfg)
 
 
 def source_identity(source):
@@ -214,6 +227,11 @@ def run_checks(cfg, base, checkpoint, require_environment=True, exact_environmen
     check('files_and_manifest_hashes', lambda: bool(validate_files(cfg, base, checkpoint)))
     check('dependencies', lambda: {name: importlib.metadata.version(name) for name in
                                   ('torch', 'transformers', 'peft', 'fastapi', 'uvicorn', 'causal-conv1d')})
+    if cfg.get('domain') == 'swe':
+        configure_solver(cfg)
+        from eur_memory_rl.domains.mini_swe import check_worker
+
+        check('mini_swe_agent', lambda: check_worker(cfg['consumer']['mini_swe']['python']))
 
     def command(argv):
         return subprocess.run(argv, check=True, capture_output=True, text=True, timeout=30).stdout.strip()

@@ -12,7 +12,7 @@ DOMAINS = {"swe", "web", "qa", "alf", "offline_web"}
 def starter_config(domain):
     if domain not in DOMAINS:
         raise ValueError(domain)
-    return {
+    cfg = {
         "schema_version": "eur-runtime-v3.2",
         "domain": domain,
         "seed": 11,
@@ -171,6 +171,9 @@ def starter_config(domain):
             "old_reference": True,
         },
     }
+    from .domains.mini_swe import configure_swe_runner
+
+    return configure_swe_runner(cfg)
 
 
 def require_hf_backend(cfg):
@@ -199,6 +202,9 @@ def load_config(path):
     if cfg.get("e_preprocessing", {}).get("profile") == "swe-evidence-hybrid-v1":
         cfg["e_preprocessing"].setdefault("config", {}).setdefault("prompt_profile", profile)
     cfg["_config_dir"] = str(Path(path).resolve().parent)
+    from .domains.mini_swe import configure_swe_runner
+
+    configure_swe_runner(cfg)
     return cfg
 
 

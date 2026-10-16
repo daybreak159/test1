@@ -1,12 +1,6 @@
-from .base import DomainAdapter
+"""SWE uses mini-swe-agent; other domains retain their own adapters."""
+from .mini_swe import MiniSWEAdapter
 
 
-class SWEAdapter(DomainAdapter):
-    domain = "swe"
-
-    def consumer_system(self):
-        return (
-            "Resolve the issue in the repository. Run commands using "
-            '{"action":{"command":"..."}}. Finish with {"final":"summary"}. '
-            "Submission is not proof of resolution; the frozen grader evaluates the resulting patch."
-        )
+class SWEAdapter(MiniSWEAdapter):
+    pass
