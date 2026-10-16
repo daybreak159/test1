@@ -69,9 +69,12 @@ def validate_files(cfg, base, checkpoint):
     return env
 
 
-def prepare(config_path, checkpoint, root, recover_main_from=None):
+def prepare(config_path, checkpoint, root, recover_main_from=None, continuous_memory=False):
     """Copy input manifests without modifying their bytes or historical files."""
     cfg = deepcopy(read_json(config_path))
+    if continuous_memory:
+        cfg['memory_continuity'] = {'enabled': True, 'replica_mapping': 'same-index-v1',
+                                    'credit_scope': 'current-group', 'test_bank_replica': 0}
     configure_solver(cfg)
     base = config_path.parent
     env = validate_files(cfg, base, checkpoint)
@@ -122,7 +125,9 @@ def prepare(config_path, checkpoint, root, recover_main_from=None):
         'sft_checkpoint': str(checkpoint), 'config_fingerprint': fingerprint(cfg),
         'environment_fingerprint': fingerprint(env),
         'source': source_identity(Path(__file__).resolve().parent),
-        'note': 'HF only; fresh optimizer/bank/cursor; budgets and dataset preserved; declared first-task replay only',
+        'note': ('HF only; explicit continuous-memory fork; initialization recorded in protocol_transition.json'
+                 if continuous_memory else
+                 'HF only; fresh optimizer/bank/cursor; budgets and dataset preserved; declared first-task replay only'),
     })
     return cfg
 

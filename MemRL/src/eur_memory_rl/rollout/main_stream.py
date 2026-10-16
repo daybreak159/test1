@@ -34,10 +34,12 @@ class MainStream:
 
     def run_episode(
         self, plan, execution_id, seed, deterministic=False, selector_mode="learned", memory_enabled=True,
-        adapter=None,
+        adapter=None, initial_bank=None,
     ):
         adapter = adapter or self.adapter
-        bank, router = Bank(plan.scope), ExternalTurnRouter()
+        bank, router = initial_bank if initial_bank is not None else Bank(plan.scope), ExternalTurnRouter()
+        if bank.scope != plan.scope:
+            raise ValueError("Inherited memory bank scope differs from task stream")
         ledger = RewardLedger(
             plan.scored_count, plan.write_count, self.cost_lambda, self.bad_write_lambda, self.cost_budget
         )
@@ -200,9 +202,14 @@ class MainStream:
             plan, execution_id, bank, rows, ledger.events, anchors, positions, executions, grades, reads
         )
 
-    def run_group(self, plan, replicas, seed, debug_zero_baseline=False, selector_mode="learned"):
+    def run_group(self, plan, replicas, seed, debug_zero_baseline=False, selector_mode="learned", initial_banks=None):
         if replicas < 2 and not debug_zero_baseline:
             raise ValueError("P=1 is only allowed with an explicit debug zero baseline")
+        if initial_banks is not None and (len(initial_banks) != replicas or
+                                         any(bank.scope != plan.scope for bank in initial_banks)):
+            raise ValueError("Inherited banks must match replica count and stream scope")
+        def bank_args(p):
+            return {"initial_bank": initial_banks[p]} if initial_banks is not None else {}
         episodes = []
         try:
             if self.main_parallel_workers == 1:
@@ -213,6 +220,7 @@ class MainStream:
                             f"{plan.id}/replica-{p}",
                             seed_for(seed, "replica", p),
                             selector_mode=selector_mode,
+                            **bank_args(p),
                         )
                     )
             else:
@@ -222,7 +230,7 @@ class MainStream:
 
                 def lane(index):
                     return [(p, self.run_episode(plan, f"{plan.id}/replica-{p}", seed_for(seed, "replica", p),
-                             selector_mode=selector_mode, adapter=self.execution_adapters[index]))
+                             selector_mode=selector_mode, adapter=self.execution_adapters[index], **bank_args(p)))
                             for p in range(index, replicas, count)]
 
                 # One lane owns one endpoint/client. Joining all lanes is the

@@ -17,6 +17,7 @@ class Trainer:
         self.output = resolved(self.cfg, self.cfg["output_dir"])
         self.cursor, self.iteration, self.main_batches = 0, 0, 0
         self.best_dev = None
+        self.memory_banks = None
 
     def resume(self, checkpoint=None):
         state = self.runtime.checkpoints.load(
@@ -26,6 +27,14 @@ class Trainer:
         self.cursor = state["data_state"]["cursor"]
         self.main_batches = state["data_state"].get("main_batches", state["iteration"])
         self.best_dev = state["data_state"].get("best_dev")
+        if self.cfg.get("memory_continuity", {}).get("enabled", False):
+            from ..data.serde import bank
+            saved = state["data_state"].get("memory_banks")
+            if self.iteration and saved is None:
+                raise ValueError("Continuous-memory resume requires checkpointed replica banks")
+            self.memory_banks = tuple(bank(value) for value in saved) if saved is not None else None
+            if self.memory_banks is not None and len(self.memory_banks) != self.cfg["global"]["replicas"]:
+                raise ValueError("Checkpoint memory bank replica count mismatch")
         best_path = self.output / "best_checkpoint.json"
         if best_path.is_file():
             best = read_json(best_path)
@@ -50,6 +59,9 @@ class Trainer:
             raise ValueError("No train plans; do not fill batches with dev/test")
         if not cfg["experiment"].get("train_roles"):
             raise ValueError("Fixed/no-memory experiments are evaluation-only")
+        continuous = cfg.get("memory_continuity", {}).get("enabled", False)
+        if continuous and (cfg["schedule"]["plans_per_batch"] != 1 or cfg.get("main_recovery")):
+            raise ValueError("Continuous memory requires one plan per update and no main recovery")
         self.output.mkdir(parents=True, exist_ok=True)
         atomic_json(self.output / "model_manifest.json", rt.shared.manifest())
         target_updates = cfg["schedule"]["batches"]
@@ -91,6 +103,7 @@ class Trainer:
                         seed_for(batch_seed, self.cursor),
                         cfg["global"]["debug_zero_baseline"],
                         cfg["experiment"].get("selector_mode", "learned"),
+                        **({"initial_banks": self.memory_banks} if continuous else {}),
                     )
                 except GroupExcluded as exc:
                     exclusions.append({"group": plan.id, "reason": str(exc)})
@@ -151,6 +164,15 @@ class Trainer:
                 exclusions,
             )
             started = time.perf_counter()
+            next_banks = tuple(episode.bank for episode in main) if continuous else None
+            if continuous:
+                from ..util import plain
+                atomic_json(self.output / f"memory-continuity-{next_iteration:06d}.json", {
+                    "iteration": next_iteration,
+                    "initial": plain(self.memory_banks), "final": plain(next_banks),
+                    "replica_mapping": "same index; no merging; main banks only",
+                    "credit_scope": "current group only; no gradients through earlier groups",
+                })
             import torch
 
             if torch.cuda.is_available():
@@ -164,6 +186,7 @@ class Trainer:
                     "main_batches": self.main_batches + 1,
                     "manifest_hash": rt.data.manifest_hash,
                     "best_dev": self.best_dev,
+                    **({"memory_banks": plain(next_banks)} if continuous else {}),
                 },
                 {"exclusions": exclusions, "resources": rt.resources.snapshot()},
             )
@@ -183,6 +206,7 @@ class Trainer:
             )
             self.iteration = next_iteration
             self.main_batches += 1
+            self.memory_banks = next_banks
             if dev and self.iteration % cfg["schedule"]["dev_interval"] == 0:
                 report, _ = evaluate(
                     rt.stream,

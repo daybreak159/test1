@@ -101,6 +101,7 @@ try:
         )
     trainer = Trainer(rt)
     trainer.resume(str(initial))
+    summary["completed_updates"] = trainer.iteration
     stage("loaded_sft_model_audit")
     with hf_attention_backend(attention_backend):
         model_audit(rt.shared, rt.generator, cfg, root / "loaded_sft_model_audit.json")
@@ -149,6 +150,8 @@ try:
 
     rt.engine.update = managed
     def replayed(task, execution_id, seed, read, budget=None):
+        if cfg.get("memory_continuity", {}).get("enabled", False) and trainer.iteration > 0:
+            return None  # A carried bank must be evaluated by a real Solver rollout.
         replay = cfg.get("first_task_replay_by_task", {}).get(task.id) or cfg.get("first_task_replay")
         if replay and task.id == replay["task_id"] and task.identity.split == "train":
             from eur_memory_rl.data.replay_swe import replay_first_execution
@@ -276,7 +279,16 @@ try:
         from eur_memory_rl.training.checkpoint import adapter_state
         from eur_memory_rl.util import seed_for
 
-        if a.full_suite:
+        if cfg.get("memory_continuity", {}).get("enabled", False):
+            if not trainer.memory_banks:
+                raise ValueError("Continuous-memory test requires committed training banks")
+            bank = trainer.memory_banks[0]
+            atomic_json(root / "frozen_bank_selection.json", {
+                "source": "final committed replica-0 memory bank; no rebuild or merging",
+                "replica": 0, "bank_hash": bank.hash, "iteration": trainer.iteration,
+                "selection_rule": "fixed before continuation; not selected by test performance",
+            })
+        elif a.full_suite:
             from eur_memory_rl.contracts import Bank, Execution
             from eur_memory_rl.data.serde import task as parse_task
             from eur_memory_rl.util import digest
