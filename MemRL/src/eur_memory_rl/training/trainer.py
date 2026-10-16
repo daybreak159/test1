@@ -42,7 +42,7 @@ class Trainer:
             "optimizer_state_reset": reset,
         })
 
-    def train(self):
+    def train(self, max_updates=None):
         rt, cfg = self.runtime, self.cfg
         plans = [p for p in rt.data.plans if p.split == "train"]
         dev = [p for p in rt.data.plans if p.split == "dev"]
@@ -52,7 +52,12 @@ class Trainer:
             raise ValueError("Fixed/no-memory experiments are evaluation-only")
         self.output.mkdir(parents=True, exist_ok=True)
         atomic_json(self.output / "model_manifest.json", rt.shared.manifest())
-        while self.main_batches < cfg["schedule"]["batches"]:
+        target_updates = cfg["schedule"]["batches"]
+        if max_updates is not None:
+            if type(max_updates) is not int or max_updates < 1:
+                raise ValueError("max_updates must be a positive integer")
+            target_updates = min(target_updates, max_updates)
+        while self.main_batches < target_updates:
             next_iteration = self.iteration + 1
             batch_seed = seed_for(cfg["seed"], "batch", next_iteration)
             main, local, exclusions = [], [], []

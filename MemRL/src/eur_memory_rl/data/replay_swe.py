@@ -1,4 +1,4 @@
-"""Predeclared first-task replay for infrastructure acceptance, not a fresh rollout."""
+"""Pinned no-memory first-task observations, never fresh Solver rollouts."""
 import json
 from pathlib import Path
 
@@ -6,10 +6,30 @@ from ..contracts import Execution
 from ..util import digest, file_hash, read_json
 
 
+def validate_replay_map(cfg, manifest):
+    mapping = cfg.get("first_task_replay_by_task", {})
+    first = {e["tasks"][0]["identity"]["sample_id"] for e in manifest["episodes"]
+             if e["split"] == "train"}
+    if set(mapping) != first:
+        raise ValueError("Replay mapping must cover exactly the first task of every training group")
+    for task_id, replay in mapping.items():
+        if replay["task_id"] != task_id:
+            raise ValueError("Replay task identity mismatch")
+        path = Path(replay["trajectory"])
+        for name, expected in replay["files_sha256"].items():
+            if file_hash(path.parent / name) != expected:
+                raise ValueError("Pinned no-memory replay input changed: " + name)
+        if file_hash(path) != replay["sha256"]:
+            raise ValueError("Pinned no-memory trajectory changed")
+
+
 def replay_first_execution(runtime, task, execution_id, seed, read, replay):
     if task.id != replay["task_id"] or task.identity.split != "train":
         raise ValueError("Replay is restricted to the declared first training task")
     path = Path(replay["trajectory"])
+    for name, expected in replay.get("files_sha256", {}).items():
+        if file_hash(path.parent / name) != expected:
+            raise ValueError("Pinned replay input changed: " + name)
     if file_hash(path) != replay["sha256"]:
         raise ValueError("Pinned no-memory trajectory changed")
     trace = read_json(path)

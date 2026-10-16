@@ -19,6 +19,7 @@ p.add_argument('--resume-checkpoint', type=Path, help='Restore same-protocol RL 
 p.add_argument("--sft-checkpoint", type=Path, help="Continue the same E/U/R weights from a trusted SWE SFT checkpoint")
 p.add_argument("--sft-weights-only", action="store_true", help="Import SWE adapter weights into a new protocol, resetting optimizer and cursor")
 p.add_argument("--startup-only", action="store_true", help="Check model, runtime, 32K backward and HF sampling, then stop before task rollouts or optimizer updates")
+p.add_argument("--max-updates", type=int, help="Stop after this cumulative update count; defer tests until all groups finish")
 a = p.parse_args()
 if a.resume_checkpoint and (a.sft_checkpoint or a.sft_weights_only or a.startup_only):
     p.error('RL resume cannot be combined with SFT initialization or startup-only')
@@ -148,13 +149,13 @@ try:
 
     rt.engine.update = managed
     def replayed(task, execution_id, seed, read, budget=None):
-        replay = cfg.get("first_task_replay")
+        replay = cfg.get("first_task_replay_by_task", {}).get(task.id) or cfg.get("first_task_replay")
         if replay and task.id == replay["task_id"] and task.identity.split == "train":
             from eur_memory_rl.data.replay_swe import replay_first_execution
             result = replay_first_execution(rt, task, execution_id, seed, read, replay)
             record("reused_executions", {"execution_id": execution_id, "source": replay,
                 "solver_calls_this_run": 0, "reward_source": "new official evaluation of actual historical patch",
-                "acceptance_only": True, "not_on_policy_solver_rollout": True})
+                "acceptance_only": False, "not_on_policy_solver_rollout": True})
             return result
         return None
 
@@ -234,7 +235,7 @@ try:
         raise SystemExit(0)
     stage("training_batch")
     with hf_attention_backend(attention_backend):
-        trainer.train()
+        trainer.train(max_updates=a.max_updates)
     completed_updates = trainer.iteration
     update = json.loads((root / f"rl/update-{completed_updates:06d}.json").read_text())
     stage("hf_policy_updated", completed_updates=completed_updates, checkpoint=update["checkpoint"])
@@ -257,6 +258,11 @@ try:
                            for n, item in enumerate(all_updates, 1)],
         },
     )
+    if a.max_updates is not None and completed_updates < cfg["schedule"]["batches"]:
+        stage("paused_after_update", status="paused_after_update", completed_updates=completed_updates,
+              next_resume_update=completed_updates + 1, checkpoint=update["checkpoint"],
+              frozen_tests_deferred=True)
+        raise SystemExit(0)
     test_count = 0
     test_plans = [plan for plan in rt.data.plans if plan.split == "test"]
     if test_plans:

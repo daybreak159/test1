@@ -90,6 +90,9 @@ def prepare(config_path, checkpoint, root, recover_main_from=None):
     cfg['rollout'] = {'backend': 'hf'}
     cfg['optimization'].pop('rollout_correction', None)
     cfg.pop('first_task_replay', None)
+    if cfg.get('first_task_replay_by_task'):
+        from eur_memory_rl.data.replay_swe import validate_replay_map
+        validate_replay_map(cfg, read_json(Path(cfg['data']['public_manifest'])))
     policy_loss = cfg['optimization'].setdefault('policy_loss', 'single_step_pg')
     if policy_loss not in {'single_step_pg', 'ppo'}:
         raise ValueError('Unknown optimization.policy_loss')
@@ -119,7 +122,7 @@ def prepare(config_path, checkpoint, root, recover_main_from=None):
         'sft_checkpoint': str(checkpoint), 'config_fingerprint': fingerprint(cfg),
         'environment_fingerprint': fingerprint(env),
         'source': source_identity(Path(__file__).resolve().parent),
-        'note': 'HF only; fresh optimizer/bank/cursor; budgets and dataset preserved; replay disabled',
+        'note': 'HF only; fresh optimizer/bank/cursor; budgets and dataset preserved; declared first-task replay only',
     })
     return cfg
 
@@ -373,6 +376,7 @@ def main():
     p.add_argument('--sft-checkpoint', type=Path, help='默认当前coding的E文本SFT权重')
     p.add_argument('--recover-main-from', type=Path, help='从未更新的同策略运行恢复首个完整主组；局部分支全部重跑')
     p.add_argument('--full-suite', action='store_true', help='完成全部训练组后重建只读记忆库并统一测试')
+    p.add_argument('--max-updates', type=int, help='本次累计完成指定组数后退出；尚未完成全部组时不运行测试')
     p.add_argument('--resume-checkpoint', type=Path, help='配合--prepared-root --train，从同协议完整RL checkpoint恢复优化器和游标')
     directories = p.add_mutually_exclusive_group()
     directories.add_argument('--root', type=Path, help='新目录；已有目录拒绝使用')
@@ -387,6 +391,8 @@ def main():
     mode.add_argument('--check', action='store_true', help='文件/依赖/GPU/Docker/实际模型API检查，不加载训练模型')
     mode.add_argument('--serve-environment', action='store_true', help='前台运行准备目录的环境服务')
     a = p.parse_args()
+    if a.max_updates is not None and (not a.train or a.max_updates < 1):
+        p.error('--max-updates需要--train及正整数')
     if a.full_suite and not a.train:
         p.error('--full-suite需要--train')
     if a.resume_checkpoint and (not a.prepared_root or not a.train or a.recover_main_from):
@@ -457,6 +463,8 @@ def main():
         command.append('--startup-only')
     if a.full_suite:
         command.append('--full-suite')
+    if a.max_updates is not None:
+        command += ['--max-updates', str(a.max_updates)]
     command_name = ('resume-command-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.json'
                     if a.resume_checkpoint else 'launch_command.json')
     write_json(root / command_name, {'command': command, 'train': a.train})
