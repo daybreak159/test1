@@ -1,29 +1,26 @@
 # MemRL 源码交付与部署运行说明
 
-更新日期：2026-10-16。适用于双方共用现有 coding 和远端服务器、已有模型及 Python 环境的情形。不包含服务器登录配置；以下 coding 命令均在 CodingUbuntu 的 Linux 终端执行。
+更新日期：2026-10-17。适用于双方共用现有 coding 和远端服务器、已有模型及 Python 环境的情形。不包含服务器登录配置；以下 coding 命令均在 CodingUbuntu 的 Linux 终端执行。
 
-2026-10-16执行框架变更：SWE Solver已改为mini-swe-agent的真实`DefaultAgent`循环，使用bash代码块执行命令，替换原来自写的JSON action/final循环。主任务、局部分支、冻结测试均走同一个适配层，E/U/R仍使用HF。本次只修改源码和配置、做离线检查，不调用模型、不启动训练；下文2026-10-15的模型验收不能视为新执行器已通过实机做题。已有`releases/current`交付包也不代表本次新源码，需重新打包后再交付。
-
-同日并行修正：默认配置已启用两条主轨迹并行，每个Solver固定承担一个replica；E/U/R调用和轨迹预处理串行访问共享HF模型及tokenizer。环境服务改为按执行/容器加锁，耗时工具与判题不再持有全局锁；启动入口会拒绝复用旧并发协议的环境服务。只做离线验收，未启动30+12实验。
-
-本日后续变更：用户明确选择方法三作为默认。当前新运行使用HF缓存采样＋单步策略梯度；0.03只标记有限概率差异，不再阻止默认PG启动或更新。下文既有验收记录属于变更前的严格方案，不能作为方法三学习效果证明。
+当前源码采用真实 mini-swe-agent 执行 SWE Solver，使用 ReasoningBank 的 Solver 提示词；两条主 Solver 流可以并行，E/U/R 使用纯 HF 并在同一训练卡上串行调用。默认训练使用 HF 缓存采样和 single_step_pg，有限概率差异只作诊断记录。源码中的执行器、并行边界、奖励和记忆协议以当前提交为准；具体部署配置、模型、数据和权重由运行环境提供。
 
 ## 1. 交付内容与当前部署
 
-交付两个文件：`MemRL_source_share_20261015.tar.gz` 和本文。包内 `使用说明.md` 与本文内容一致；`MANIFEST.sha256.json` 用于检查文件是否变化。源码、完整训练配置、小型题目清单、启动脚本和测试都在包内。大模型、SFT权重、完整数据集、Docker镜像和Python环境使用服务器已有文件，不装入压缩包。
+本目录同步的是 MemRL 核心源码说明。GitHub 中保留 `src/`、正式训练和预处理脚本、启动入口及工程配置；测试、基线、实验数据、完整配置、模型权重、Docker 镜像和 Python 环境不随源码同步，由运行环境另行提供。
 
-| 内容 | coding绝对路径 |
+| 内容 | 部署示例路径 |
 |---|---|
-| 唯一源码目录 | `/home/ubuntu/coding/MemRL/02_源码与脚本` |
-| 源码压缩包 | `/home/ubuntu/coding/MemRL/02_源码与脚本/releases/current/MemRL_source_share_20261015.tar.gz` |
-| 单独交付文档 | `/home/ubuntu/coding/MemRL/02_源码与脚本/releases/current/MemRL_部署与运行说明_20261015.md` |
-| 开发源码 | `/home/ubuntu/coding/MemRL/02_源码与脚本` |
-| 包内默认完整配置 | `configs/coding_hf.json` |
-| 新运行输出父目录 | `/home/ubuntu/coding/MemRL/03_实验结果/runs/memrl` |
+| 源码目录 | `/path/to/MemRL` |
+| 源码压缩包 | `/path/to/MemRL.zip` |
+| 单独交付文档 | `/path/to/MemRL/README.md` |
+| 开发源码 | `/path/to/MemRL` |
+| 运行配置 | 由部署环境提供；源码仓库不包含实际配置 |
+| 新运行输出父目录 | `/path/to/runs/memrl` |
 
 | 组件 | 所在位置与调用方式 | 当前职责 |
 |---|---|---|
-| Solver、Pair Judge | coding GPU0；`http://127.0.0.1:8000/v1`；冻结Qwen3.5-4B | 主任务、局部分支做题和结果比较 |
+| Solver 1、Pair Judge | coding GPU0；`http://127.0.0.1:8000/v1`；冻结Qwen3.5-4B | 主任务、局部分支做题和结果比较 |
+| Solver 2 | 远端服务器冻结Qwen3.5-4B；经 SSH 隧道由 coding 的 `http://127.0.0.1:18281/v1` 访问 | 并行任务流的主任务和局部分支做题 |
 | E/U/R | coding GPU1；HF训练进程直接加载，没有HTTP端口 | E/U采样、R候选评分、概率重算及LoRA更新 |
 | Embedding | 远端GPU1；coding通过`http://127.0.0.1:8002/v1`调用 | 4096维记忆向量 |
 | SWE环境和官方判题 | coding Docker；`http://127.0.0.1:18119` | 隔离工具执行、补丁归档及SWE-bench判题 |
@@ -32,7 +29,7 @@
 
 ### SWE Solver的执行方式
 
-2026-10-16提示词校正：`domains/reasoningbank_prompts.py`逐字保留此前ReasoningBank运行的系统、题目、工具观察和格式反馈模板；无记忆时系统提示词原样使用，有记忆时按ReasoningBank追加原记忆使用说明和R选出的记忆块。记忆块仍由MemRL渲染，E/U/R构建和筛选方式不变。harness revision升级，须新建运行目录，不恢复旧提示词协议的RL checkpoint。双Solver的有/无记忆首响应共4次API诊断均产生合法单bash块，但不代表完整任务正确率；原简化提示词组未进行RL更新，日志保留。
+`domains/reasoningbank_prompts.py`保留ReasoningBank运行所需的系统、题目、工具观察和格式反馈模板；无记忆时使用基础提示词，有记忆时追加原记忆使用说明和R选出的记忆块。记忆块仍由MemRL渲染，E/U/R构建和筛选方式不变。harness revision变化时，应新建运行目录，不恢复旧提示词协议的RL checkpoint。提示词和执行器协议属于源码的一部分；是否能在具体环境运行，需要按接收方的服务、依赖和配置单独检查。
 
 `domains/swe.py`选择`MiniSWEAdapter`，由独立Python进程中的mini-swe-agent管理任务循环、格式反馈和提交。父进程只桥接现有模型API、工具接口和预算，不再解析Solver的JSON action/final。模型请求仍经过原来的`ChatModel`，保留`api_requests.jsonl`、`api_responses.jsonl`及token计数；Docker仍使用原来的固定镜像、reset校验、工具输出归档和官方判题。mini不会再创建第二个题目容器。
 
@@ -61,15 +58,15 @@ sed -n '1,120p' source.py
 
 完成时执行`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`。只有命令退出码为0且输出首行为该标记才视为提交；真正补丁仍由环境`finalize`提取，提交不代表官方判题成功。空正文、无命令或多个代码块进入格式反馈；输出因token上限截断时不执行其中的命令。基础设施错误仍明确报错，不能冒充做题失败。
 
-每个任务开始时R只选择一次记忆，注入系统提示词；内部工具步骤不调用E/U/R。局部分支只执行当前短预算内的步骤，然后交给Judge，不调用E/U或完整官方判题。主任务和冻结测试仍按原流程判题。
+每个任务开始时R只选择一次记忆，注入系统提示词；内部工具步骤不调用E/U/R。局部分支只执行当前短预算内的步骤，然后交给Judge，不调用E/U或完整官方判题。主任务和可选冻结测试仍按配置声明的流程判题。
 
 每次执行额外保存`<output_dir>/solver_trajectories/<execution_id的hash>.traj.json`及对应stderr日志。原生轨迹包含mini版本、输入消息、命令、工具结果、调用计数及预算；`info.memrl.execution_id`可反查执行ID，正常结束后补充实际补丁和状态hash。E仍使用公开结构化事件及现有32K预处理，不接收私有测试日志。
 
 仅检查mini依赖、无需访问模型或Docker的命令：
 
 ```bash
-cd /home/ubuntu/coding/MemRL/02_源码与脚本
-/home/ubuntu/coding/venvs/swebench/bin/python \
+cd /path/to/MemRL
+/path/to/swebench/bin/python \
   src/eur_memory_rl/domains/mini_swe_worker.py --check
 ```
 
@@ -89,27 +86,27 @@ cd /home/ubuntu/coding/MemRL/02_源码与脚本
 
 `consumer.base_url`承担replica-0，第二个端点承担replica-1，两条任务流有各自的HTTP客户端、容器和记忆库。同一任务流内仍按题目顺序执行；一条流等待HF时，另一Solver可以继续做题。E/U/R的采样、adapter切换、索引和共享tokenizer操作由同一把锁保护，并在工作线程内显式进入注意力上下文。主轨迹全部返回后才运行局部阶段，整组局部采样结束后才更新参数。失败的主轨迹组整体排除，不把部分完成的样本交给更新。
 
-局部分支继续复用这两个端点，主任务与局部任务不会争抢同一个Solver客户端。所有端点统一记录执行、判题及超时后的有效奖励规则。`solver_dispatch.jsonl`逐条记录执行ID、worker编号、开始/完成/失败和耗时；`solver_parallelism.json`记录端点与更新边界。最终12题冻结测试目前仍按原逻辑串行，本次没有改为并行。
+局部分支继续复用这两个端点，主任务与局部任务不会争抢同一个Solver客户端。所有端点统一记录执行、判题及超时后的有效奖励规则。`solver_dispatch.jsonl`逐条记录执行ID、worker编号、开始/完成/失败和耗时；`solver_parallelism.json`记录端点与更新边界。冻结测试是否并行、使用哪一组记忆库，由外部配置声明。
 
 环境服务只在查询/修改会话和幂等缓存时持有短暂全局锁；同一执行的命令、finalize、close和判题仍串行，不同执行可以并行。相同请求ID的并发重试只执行一次；同ID不同内容会被拒绝。WebArena仍保持共享后端独占要求。
 
-`/health`现在返回`concurrency_protocol: per-execution-v1`。当`main_parallel_workers > 1`时，即使环境配置指纹相同，启动入口也拒绝旧版服务，不会自动停止该端口的现有进程。端口空闲时沿用`--start-environment`启动本轮新服务。部署审查时18119空闲，两个Solver接入端口及Embedding转发端口均在监听；仅端口监听不代表模型调用验收通过。
+`/health`现在返回`concurrency_protocol: per-execution-v1`。当`main_parallel_workers > 1`时，即使环境配置指纹相同，启动入口也拒绝旧版服务，不会自动停止该端口的现有进程。端口空闲时沿用`--start-environment`启动本轮新服务。端口和模型服务必须由部署环境自行检查；仅端口监听不能替代实际调用检查。
 
-如需串行对照，将新配置的`global.main_parallel_workers`设为1，并创建新运行目录。并行配置必须使用足够且不重复的端点，目前只开放给SWE；这些条件在加载GPU权重前检查。历史30+12运行目录及其配置未修改，仍需另行创建本轮配置；五组首题no-memory轨迹复用尚未在本次并行修正中扩展。
+如需串行对照，将新配置的`global.main_parallel_workers`设为1，并创建新运行目录。并行配置必须使用足够且不重复的端点，目前只开放给SWE；这些条件在加载GPU权重前检查。已有运行目录及其配置不应直接复用；需要新建运行目录，并在配置中明确数据清单和首题轨迹的来源。
 
 这里所有`127.0.0.1`均指命令所在机器。coding的8002是转发端口，远端Embedding实际监听18082；远端隧道把二者接通。不是把Embedding部署到coding CPU。
 
 ## 2. 最短使用流程
 
-### 五组实验逐组启动与恢复（2026-10-16）
+### 分组训练与恢复
 
-新配置 `configs/20261016-mini双Solver-EU-SFT-逐组.json` 固定同一份 20 主任务＋10 探针＋12 测试清单、五组首题 no-memory 文件及校验值。两个 replica 复用各组同一首题公开轨迹，但分别重新采样 E/U、维护独立空记忆库。历史 Solver 成本保留用于原奖励核算，新调用数单独记录为零；历史轨迹不是新执行器的 on-policy Solver 样本。
+分组训练可以使用多组主任务、局部 probe 和冻结测试任务；具体任务清单和配置不随本源码同步。两个 replica 分别采样 E/U 并维护独立记忆库；历史轨迹若被用于首题初始化，必须在配置中明确声明，不能把它当作新执行器的 on-policy Solver 样本。
 
-首次通过 `--sft-checkpoint` 指定 U SFT 的 `iteration-000088`（含已有 E SFT 和新 U SFT），使用新 RL 优化器。命令参数 `--max-updates N` 是累计更新边界，不是本次增加 N 次：首次 `--train --full-suite --max-updates 1`，第二次在同一 `--prepared-root` 下加 `--resume-checkpoint <iteration-000001目录> --max-updates 2`，以此至 5。始终通过 `bash scripts/memrl.sh` 启动，不改既有配置、数据清单或源码。每次仍加 `--start-environment`，只清理本次启动的环境桥。
+首次通过 `--sft-checkpoint` 指定可用的 E/U/R SFT 初始化权重，使用新 RL 优化器。命令参数 `--max-updates N` 是累计更新边界，不是本次增加 N 次：每次从上一完整 checkpoint 恢复，并把累计上限提高到下一组。始终通过 `bash scripts/memrl.sh` 启动，不改既有配置、数据清单或源码。每次仍加 `--start-environment`，只清理本次启动的环境桥。
 
-前四组完成后以 `paused_after_update` 正常退出，不执行冻结测试。恢复会加载完整 LoRA、优化器、RNG、数据游标；组间记忆库按独立任务流设计清空。第 5 组更新后才用最终参数重建只读记忆库、统一测试 12 题；没有中间测试。组末 checkpoint 使用原子发布并有 SHA256，不能把 `--sft-checkpoint` 权重导入当成第二至第五组的 RL 恢复。当前只保护已完成组；组内失败没有任意步骤恢复承诺。源码/依赖检查和长输入预检仍在每次新进程启动时运行。
+每组更新后可以以 `paused_after_update` 正常退出；冻结测试应在配置声明的最终更新边界执行。恢复会加载完整 LoRA、优化器、RNG、数据游标和需要连续保存的记忆库。组末 checkpoint 使用原子发布并有 SHA256，不能把 `--sft-checkpoint` 权重导入当作 RL 恢复。源码/依赖检查和长输入预检仍在每次新进程启动时运行。
 
-源码已在服务器上时，直接使用下述路径。若另行解压，可解压至新的目录；脚本根据自身位置寻找源码和包内配置，不要求覆盖开发目录。
+源码已在服务器上时，直接使用下述路径。若另行解压，需要同时提供与机器、模型和数据匹配的外部配置；不要覆盖已有开发目录。
 
 ```bash
 cd /home/ubuntu/coding/MemRL/02_源码与脚本
@@ -119,7 +116,7 @@ bash scripts/memrl.sh --help
 
 # 准备新运行目录：只读模型路径和清单，不加载GPU模型。
 # 将下面目录名改成自己的名称；目录必须尚不存在。
-RUN_DIR=/home/ubuntu/coding/MemRL/03_实验结果/runs/memrl/my-hf-run-001
+RUN_DIR=/path/to/runs/memrl/my-hf-run-001
 bash scripts/memrl.sh --prepare-only --root "$RUN_DIR"
 
 # 临时启动本轮环境服务，实际请求模型API并检查Docker工具链。
@@ -168,8 +165,8 @@ bash scripts/memrl.sh --train --start-environment
 | `--serve-environment` | 使用`--prepared-root`在前台单独运行环境服务 |
 | `--root PATH` | 指定尚不存在的新运行目录 |
 | `--prepared-root PATH` | 使用只准备过的目录；不能与`--root`或`--config`同时使用 |
-| `--config PATH` | 完整配置，默认包内`configs/coding_hf.json`；相对资源路径以该配置所在目录为基准 |
-| `--sft-checkpoint PATH` | 默认本文指定的文本E SFT初始化权重 |
+| `--config PATH` | 外部完整配置；相对资源路径以该配置所在目录为基准 |
+| `--sft-checkpoint PATH` | 指定 E/U/R 的 SFT 初始化权重 |
 | `--source-dir PATH` | 明确指定源码目录，供包外独立脚本使用 |
 | `--report PATH` | 保存`--check`的JSON报告 |
 
@@ -177,9 +174,9 @@ bash scripts/memrl.sh --train --start-environment
 
 ```bash
 bash scripts/memrl.sh \
-  --config "$PWD/configs/coding_hf.json" \
-  --sft-checkpoint /home/ubuntu/coding/MemRL/03_实验结果/checkpoints/E文本SFT30_RL初始化权重 \
-  --root /home/ubuntu/coding/MemRL/03_实验结果/runs/memrl/my-hf-run-002 \
+  --config "$PWD/path/to/external-config.json" \
+  --sft-checkpoint /path/to/sft-checkpoint \
+  --root /path/to/runs/memrl/my-hf-run-002 \
   --train --start-environment
 ```
 
@@ -211,18 +208,12 @@ bash scripts/memrl.sh \
 
 ## 4. 当前训练配置
 
-默认不是30+12完整实验，也不是此前的3+2+1。包内清单是现有**5个主任务＋2个probe任务＋1个冻结测试任务**，一个计划、一个batch。两个全局replica、局部候选和比较会重复运行Solver，因此不等于只调用Solver八次。
-
-| 部分 | 题目ID |
-|---|---|
-| main，按顺序 | `django__django-11740`、`15104`、`15561`、`15252`、`15268`（后四项同为`django__django-`前缀） |
-| probe | `django__django-15278`、`django__django-14765` |
-| test | `django__django-14122` |
+源码不内置固定题目清单；实际运行由外部配置声明主任务、局部 probe 和冻结测试。多个 replica、局部候选和比较会重复运行 Solver，因此题目数量不等于 Solver 调用次数。
 
 | 配置 | 当前值 |
 |---|---|
-| 基座 | `/home/ubuntu/coding/models/Qwen3.5-4B`；revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` |
-| RL初始化权重 | `/home/ubuntu/coding/MemRL/03_实验结果/checkpoints/E文本SFT30_RL初始化权重` |
+| 基座 | 由外部配置指定；使用与 checkpoint 匹配的 Qwen3.5-4B 基座和 revision |
+| RL初始化权重 | 由 `--sft-checkpoint` 或外部配置指定 |
 | LoRA | E/U/R独立adapter，rank=8；完整248个目标层在配置中，实际兼容性由checkpoint加载校验 |
 | train_roles | E、U、R；Solver/Judge/Embedding冻结 |
 | dtype、device | BF16、`cuda:1` |
@@ -259,16 +250,14 @@ logprob是自然对数概率。单token差0.03对应概率比最多约`exp(0.03)
 
 为什么纯HF仍可能失败：Qwen3.5包含线性注意力/递归状态；逐token缓存生成和整段训练重算可能走不同计算路径，BF16及内核也可能产生数值偏差。“都是HF”本身不保证两个路径一致。这与早先HF/vLLM跨后端差异属于不同问题。
 
-已知实测：
+默认行为：
 
-| 设置 | 记录 |
+| 设置 | 作用 |
 |---|---|
-| HF生成开启KV cache | 短输入审计最大logprob差约0.1234536，大于0.03，启动被拒绝 |
-| HF生成关闭KV cache | 此前短输入E约2.16e-7、U约1.91e-6，检查通过 |
+| HF生成开启KV cache | 当前默认方法三；有限概率差异只记录，不阻止 single_step_pg 更新 |
+| HF生成关闭KV cache | 可作为严格概率重算对照；需在新配置和新运行目录中明确启用 |
 
 当前默认配置为`generation.use_generation_cache=true`、`optimization.policy_loss=single_step_pg`。E/U使用`-advantage * sum(有效回答token的重算logprob) * row_weight / divisor`；R使用同样权重乘所选slate的联合logprob。没有新旧概率比、PPO裁剪或混合后端修正；不覆盖原始old_logprobs。每批完整采样后积累所有梯度，再各优化器step一次。缓存生成与整段重算仍可能不同，因此属于接受该差异的近似，不能保证无偏或学习有效。
-
-2026-10-15方法三短输入实测：加载当前SFT权重后，启动审计通过，E（366输入＋4输出）最大logprob差约0.00006215，U（130输入＋4输出）约0.011827，均未超过0.03。审计耗时约103秒，未运行做题或optimizer step。此前开启cache超限的结果属于不同测试条件，不能用本次短输入结果推断长输入也对齐。记录在`03_实验结果/diagnostics/method3-default-20261015`。
 
 `rl/probability_diagnostics.jsonl`持久记录E/U/R概率差异。E/U记录row_id、输入/输出/总长度、重算耗时、差异均值/最大值/p50/p95/p99及超阈值比例；backward事件按row_ids关联反向耗时和本次update以来峰值显存（不是该条样本独占显存）。microbatch>1时耗时属于整组，不当作单样本耗时。R差异单位是joint slate，不是单token。更新结果也保存同一诊断列表。
 
@@ -334,7 +323,7 @@ export PYTHONPATH=/home/ubuntu/coding/MemRL/02_源码与脚本/src
 
 以下命令在 **coding 的 Linux 终端**执行。Solver 和 Judge 共用 `qwen3.5-4b`；Embedding 通过 coding 的8002端口调用远端模型。当前无需API密钥。
 
-### Solver
+### Solver 1（主端点）
 
 ```bash
 curl --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
@@ -349,6 +338,28 @@ curl --noproxy '*' http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 正文位于 `choices[0].message.content`。此例关闭思考以快速验证调用；正式Solver配置开启思考，输出预算为32768。
+
+### Solver 2（并行端点）
+
+第二条 Solver 使用相同的 OpenAI 兼容接口。当前部署中，模型运行在远端服务器，
+通过 SSH 隧道映射到 coding 的 `127.0.0.1:18281`；`local_solver_endpoints` 使用这个
+coding 本地转发地址承担另一个 replica。若接收方采用不同的隧道或直接暴露远端服务，
+应将下面地址替换为实际可访问的地址。
+
+```bash
+curl --noproxy '*' http://127.0.0.1:18281/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.5-4b",
+    "messages": [{"role": "user", "content": "请简短解释二分查找。"}],
+    "max_tokens": 256,
+    "temperature": 0.6,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+两个端点的请求格式和模型协议相同；运行时由 `consumer.base_url` 选择 Solver 1，
+由 `local_solver_endpoints` 选择 Solver 2。不要把第二个端点当作 E/U/R 的训练后端。
 
 ### Judge（同一个模型服务）
 
@@ -424,16 +435,15 @@ NO_MEMORY
 
 当前coding为双RTX3090，各24GiB；WSL内核6.18.54.1，WSL可见内存约62.7GiB、swap16GiB。CPU offload需要这部分内存与CPU/GPU传输。32K通过不代表任意输入输出组合均可训练；OOM时保留日志，先检查其他进程和实际输入/输出长度，再决定减少预算或优化证据输入，不能把静默截断当作完整训练。
 
-包内`configs/dependency_lock.json`为现有验收依赖锁，启动preflight会核对安装版本。其platform字段来自早期导出，不能用它判断当前WSL内核。`pyproject.toml`声明Python>=3.11，而现有验收环境为3.10；当前通过已有Python和源码路径使用，不执行`pip install -e .`或升级现有依赖。`eur-fast-ops-20261014`不是完整venv。
+部署环境可以提供 `dependency_lock.json` 供启动检查。其 platform 字段不能替代当前 Python、GPU、WSL 或驱动的实际检查。`pyproject.toml`声明Python>=3.11，而现有验收环境为3.10；当前通过已有Python和源码路径使用，不执行`pip install -e .`或升级现有依赖。`eur-fast-ops-20261014`不是完整venv。
 
 权限要求：能读取模型和checkpoint、写入独立运行目录、使用GPU及Docker、执行官方评测Python、访问模型API。更换用户后应实际检查这些权限，不能仅凭目录存在判断可用。
 
-| 既有数据 | coding路径 |
+| 外部数据 | 部署路径（不随仓库同步） |
 |---|---|
-| no-memory500 | `/home/ubuntu/coding/MemRL/03_实验结果/datasets/baselines/nomemory500` |
-| ReasoningBank220 | `/home/ubuntu/coding/MemRL/03_实验结果/datasets/baselines/reasoningbank220` |
-| ReasoningBank30+12 | `/home/ubuntu/coding/MemRL/03_实验结果/datasets/baselines/reasoningbank30plus12_repeat` |
-| 文本E SFT教师集 | `/home/ubuntu/coding/MemRL/03_实验结果/datasets/sft/memrl-e-text-sft30-20261015-r2-data/teacher_bundle/teacher`；24train、6dev及semantic_review.json |
+| no-memory 轨迹 | `/path/to/external/datasets/nomemory` |
+| ReasoningBank 轨迹 | `/path/to/external/datasets/reasoningbank` |
+| 文本E SFT教师集 | `/path/to/external/datasets/e-text-sft/teacher`；需包含训练、开发和语义审查文件 |
 
 独立压缩原始轨迹（只加载tokenizer，不生成/训练模型）：
 
@@ -444,49 +454,24 @@ PY=/home/ubuntu/coding/venvs/eur-alf-pilot-20261011/bin/python
   --prompt-profile e-text-v1 --max-input-tokens 32768 --output /新的压缩输出目录
 ```
 
-SFT复现实验使用包内`run_text_e_sft.py --help`查看参数：`--config`完整配置、`--teacher`上述教师目录、`--checkpoint`受信任的原始初始化checkpoint、`--root`新结果目录。当前交付默认直接复用已完成的SFT权重，无需重做SFT；不要误把已SFT权重当作原始起点后宣称重现同一实验。工具CLI、SFT、预处理入口均在源码中，默认训练只由统一入口执行。包中不包含Codex认证或教师生成密钥。
+SFT复现实验使用`run_text_e_sft.py --help`查看参数：`--config`外部完整配置、`--teacher`教师目录、`--checkpoint`受信任的初始化checkpoint、`--root`新结果目录。工具CLI、SFT和预处理入口均在源码中，默认训练只由统一入口执行。认证信息和教师生成密钥不随源码提供。
 
-## 9. 验收记录与边界
+## 可复用训练协议
 
-2026-10-15已完成以下验收。源码测试、服务检查、环境工具检查和真实HF启动分别记录；不把启动验收等同于完整RL实验，也不承诺记忆有效性或做题正确率。
-
-| 验收 | 结果 |
-|---|---|
-| 本地核心源码和启动入口测试 | 153项通过；修改入口的静态检查、shell语法检查通过 |
-| 源码包解压后，coding现有Python运行完整tests | 153项通过；`--help`和新目录准备成功 |
-| 包内配置和依赖 | 任务清单hash、基座、真实SFT权重、grader数据/解释器路径存在；8个题目镜像本地可用 |
-| 模型调用 | Solver实际返回`OK`；Embedding实际返回4096维有限向量，范数约1.0000000008 |
-| 环境服务 | 自动启动与清理成功；真实题目reset、只读命令、finalize、close通过，初始hash匹配、补丁为空 |
-| 配置隔离保护 | 使用另一运行目录连接现有环境服务时被明确拒绝；使用同一准备目录检查通过 |
-| 新adapter模型审计与完整Runtime | 通过 |
-| 真实SFT权重加载后审计 | E最大logprob差8.94e-8，U为5.36e-7，R读出差0；梯度隔离通过 |
-| 长输入反向 | 32768输入＋1目标token，约184.18秒，峰值allocated14,901,854,208字节，约13.88GiB；E梯度范数85.35，U/R为0 |
-| HF采样检查 | R16候选、E/U各最多8token通过；不代表完整记忆格式/质量验收 |
-| 整轮启动 | `startup_passed`，约390.11秒；task_rollouts=0、optimizer_steps=0、completed_updates=0 |
-
-本轮证据目录：`/home/ubuntu/coding/MemRL/03_实验结果/runs/memrl/handoff-validation-20261015`。其中`environment_smoke.json`、`extracted_archive_checks.json`、`loaded_sft_model_audit.json`、`long_input_precheck.json`、`summary.json`及日志可交叉核对。
-
-测试结束后，本轮自动启动的18119服务已停止，避免占用后续运行的端口；接收人使用`--start-environment`启动自己的本轮服务。Solver未重启，GPU1训练模型已退出并释放资源。远端Embedding通过coding转发API验收，没有重启远端服务或改变登录配置。正式5+2+1训练、官方判题完整执行、SFT重训和长输出概率一致性未在本次交付验收中执行。
-
-### 目录整理后的复验
-
-唯一源码位于`02_源码与脚本`，部署配置位于`01_部署与配置`，数据、权重、运行和诊断位于`03_实验结果`。开发及清理约定见同目录`开发与实验规范.md`；实验索引见`../03_实验结果/实验索引.md`。不再维护独立共享源码目录或`.bak`副本，旧源码通过Git的`history/*`标签追溯。
-
-迁移后153项测试通过，模型API与真实工具环境检查通过；真实HF启动验收耗时386.90秒，32K输入反向耗时181.82秒，峰值allocated约13.88GiB。没有正式题目rollout或optimizer更新。证据位于`03_实验结果/diagnostics/20261015-layout-startup`。500条no-memory轨迹路径全部有效，内部软链接无失效项；整理清单位于`diagnostics/file_organization_20261015`。32K容量检查仍仅包含1个目标token，不代表长输出训练已验收。
+本源码不在 README 中记录历史测试结果、运行日志或实验准确率；这些内容属于独立实验目录。下面只保留可复用的协议说明。
 
 
-## 夜间五组训练协议
 
-30道训练题预声明为五组，每组4道主任务、2道局部probe；每组2个replica，E/U/R权重与优化器连续更新5次。历史协议各组从空记忆库开始并在最后重建测试记忆库；2026-10-16第一组完成后，后四组改用下述连续记忆协议，不改写历史记录。
+训练任务可以按组组织；每组包含主任务、局部probe和可选冻结测试，每组可配置多个replica。E/U/R权重、优化器、随机状态和需要连续保存的记忆库在更新边界保存，具体组数和任务数量由外部配置决定。
 
 统一入口增加 `--train --start-environment --full-suite`；完整命令须使用本轮准备完成的独立配置和输出目录，不复用历史运行目录。`--full-suite`不是RL断点续训开关。
 
-Judge可显式启用 `structured_output=true` 和 `repair_attempts=2`，非零评分仍要求工具证据。`local.pin_probe_backend=true`将同一probe的参考和所有候选固定到同一Solver；不同probe可并行。`local.min_legal_candidates=2`只根据采样前公开记忆库筛选节点，不保证不同动作或非零奖励；没有合格节点时停止排查。`schedule.require_declared_plans=true`禁止失败后自动替换预声明主组。
+Judge可显式启用 `structured_output=true`、`repair_attempts=2` 和 `output_tokens`；`output_tokens` 控制每次 Judge 响应的最大输出长度，默认值由配置提供。非零评分仍要求工具证据。`local.pin_probe_backend=true`将同一probe的参考和所有候选固定到同一Solver；不同probe可并行。`local.min_legal_candidates=2`只根据采样前公开记忆库筛选节点，不保证不同动作或非零奖励；没有合格节点时停止排查。`schedule.require_declared_plans=true`禁止失败后自动替换预声明主组。
 
 
 ### 分组环境准备与Windows下载
 
-`prepare_grouped_swe.py --deferred-environments`预先冻结全部题目和镜像内容摘要；`environment.readiness_mode=per-group-v1`要求每组开始前对该组主任务及probe各做两次独立干净重置。未缓存的后续镜像可以同时下载；该组开始时仍未齐则最多等待两小时，不能跳题。测试环境在统一测试前同样验收。`reset_audit.json`明确记录分组模式，不把尚未执行的检查标成通过；实际证据写入运行目录`rl/environment_readiness.json`。
+`prepare_grouped_swe.py --deferred-environments`可以预先冻结题目和镜像内容摘要；`environment.readiness_mode=per-group-v1`要求每组开始前对该组主任务及probe执行独立干净重置。未缓存的后续镜像可以后台下载，但组开始前必须满足该组的环境就绪条件，不能跳过必要检查。`reset_audit.json`记录分组模式，实际证据写入运行目录`rl/environment_readiness.json`。
 
 `scripts/windows_registry_bridge.py`提供仅监听WSL回环地址的临时镜像转发、Windows原生curl下载worker和Docker现有containerd命名空间导入。Windows文件缓存位于`%TEMP%\MemRL-registry-cache`；下载后Windows与WSL分别验证SHA256。此方式不修改Docker守护进程或全局代理配置。仅缺失镜像需要新下载，已有镜像层继续复用。
 
@@ -497,30 +482,30 @@ Judge可显式启用 `structured_output=true` 和 `repair_attempts=2`，非零�
 
 SSH默认打开文件数软上限1024可能在32K反向CPU activation offload时耗尽，内核表现为`dxg get_unused_fd_flags failed: ffffffe8`并伴随CUDA unknown及EMFILE。统一启动脚本仅将自身进程树软上限提高到65536（受硬上限约束），不改系统配置。显存、内存与文件句柄上限是不同资源，不能把此错误直接记为OOM。
 
-### U 专项 SFT（2026-10-16）
+### U 专项 SFT
 
 通过同一入口运行 `bash scripts/memrl.sh --u-sft --config 配置.json --teacher 已审阅教师目录 --checkpoint 已接受的RL前初始化目录 --root 新结果目录`。默认仅准备并校验数据；显式加 `--train` 才加载 coding GPU1 并训练。需要原教师目录的 train.json、dev.json、semantic_review.json，以及配置旁的 public_manifest.json 用于来源隔离核验。
 
 本入口始终将 U 恢复成原始 Qwen3.5-4B 底座上的新 LoRA（初始 B 矩阵为零），仅从 checkpoint 导入 E/R；不继承 checkpoint 的 U 或任何优化器。新建 U AdamW，默认 lr=1e-4，仅一轮。旧示范加显式标记的独立记忆保留合成场景；训练前后验证固定 dev，核对 U 改变而 E/R/底座不变。使用与 RL 相同 GPU 文件锁，不会停止其他服务，不自动发布为默认权重或启动 RL。
 
-当前运行目录为 `03_实验结果/runs/sft/u-sft-20261016-r1`。设计与数据边界见 `01_部署与配置/historical_reports/2026-10-16_U专项SFT.md`；实际完成状态以该运行目录的 summary.json 为准。
+U SFT 的具体教师集、初始化权重和输出目录由部署配置指定；源码只提供训练入口和校验逻辑。
 
-### 连续记忆、分组更新（2026-10-16）
+### 连续记忆、分组更新
 
 `memory_continuity.enabled=true` 时，每个 replica 继承自身上一组的主轨迹记忆库；两条流不合并、不交换记忆。局部候选树是反事实评估，不写回主库。每组所有主轨迹和局部树完成后，各角色仅更新一次，将两份完整记忆库、优化器、RNG和训练游标共同保存到 checkpoint。重启时恢复，不依赖进程内缓存。
 
-本轮从已完成的第一组切换协议，第二组旧尝试停止且未更新。迁移是显式新运行，保留第一组 E/U/R、优化器、RNG和 cursor=1，并从原始 rollout 读取各 replica 的主库。迁移工具不调用模型：
+如果要从已完成的更新边界切换到连续记忆协议，应显式创建新的运行目录，保留 E/U/R、优化器、RNG 和训练游标，并从对应 rollout 读取各 replica 的主库。迁移工具不调用模型：
 
 ```bash
 cd /home/ubuntu/coding/MemRL/02_源码与脚本
 /home/ubuntu/coding/venvs/eur-alf-pilot-20261011/bin/python scripts/fork_continuous_memory.py \
-  --source-root /home/ubuntu/coding/MemRL/03_实验结果/runs/memrl/20261016-mini-dual-sft-five-groups-r2 \
+  --source-root /path/to/completed-run \
   --iteration 1 \
-  --root /home/ubuntu/coding/MemRL/03_实验结果/runs/memrl/20261016-mini-dual-continuous-memory-r1
+  --root /path/to/new-continuous-memory-run
 ```
 
 工具输出新的完整 checkpoint 路径；用统一入口 `bash scripts/memrl.sh --prepared-root 新运行目录 --train --full-suite --max-updates 2 --resume-checkpoint 新checkpoint路径 --start-environment` 启动第二组。完成后核验新 checkpoint，再分别将累计上限改为3、4、5，每次恢复上一组完整 checkpoint。
 
-新协议后四组的首题必须带已有记忆真实调用 Solver，不再复用 no-memory 轨迹。最后12道测试固定使用最终 replica-0 的主库，不重建、不合并、不按测试结果选库；测试期间库和参数均冻结。奖励只归因于当前组，旧组决策不会收到后续组的追溯梯度。记忆增多扩大可选状态，不保证正确率或非零优势必然提高。
+连续记忆协议的后续首题必须带已有记忆真实调用 Solver，不再默认复用 no-memory 轨迹。冻结测试应固定使用声明的最终记忆库；测试期间记忆库和参数均冻结。奖励只归因于当前组，旧组决策不会收到后续组的追溯梯度。记忆增多扩大可选状态，不保证正确率或非零优势必然提高。
 
 源/目标协议 hash、checkpoint SHA256、两份库的 hash 和条目数写入 `protocol_transition.json`；每组起止库写入 `rl/memory-continuity-XXXXXX.json`，checkpoint 的 `data_state.memory_banks` 保存完整状态。旧运行配置、rollout 和 checkpoint 不被覆盖。
